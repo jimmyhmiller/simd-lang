@@ -24,6 +24,7 @@ pub enum Token {
     If,
     Else,
     While,
+    Break,
 
     // Arithmetic operators
     Plus,
@@ -41,6 +42,8 @@ pub enum Token {
 
     // Logical/bitwise operators
     Amp,
+    AmpAmp,
+    PipePipe,
     Pipe,
     Tilde,
     Caret,
@@ -177,13 +180,32 @@ impl<'a> Lexer<'a> {
             "if" => Token::If,
             "else" => Token::Else,
             "while" => Token::While,
+            "break" => Token::Break,
             "_" => Token::Underscore,
+            _ if text.starts_with("__") => {
+                panic!("names starting with __ are reserved: '{}', at line {}", text, self.line)
+            }
             _ => Token::Ident(text.to_string()),
         }
     }
 
     fn read_number(&mut self) -> Token {
         let start = self.pos;
+        let radix = match (self.peek(), self.peek2()) {
+            (Some(b'0'), Some(b'x' | b'X')) => 16,
+            (Some(b'0'), Some(b'b' | b'B')) => 2,
+            _ => 10,
+        };
+        if radix != 10 {
+            self.advance();
+            self.advance();
+            let digits = self.pos;
+            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                self.advance();
+            }
+            let text = std::str::from_utf8(&self.input[digits..self.pos]).unwrap();
+            return Token::IntLit(Self::parse_int(text, radix));
+        }
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.advance();
         }
@@ -198,11 +220,19 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
             let text = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-            Token::FloatLit(text.parse().unwrap())
-        } else {
-            let text = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-            Token::IntLit(text.parse().unwrap())
+            return Token::FloatLit(text.parse().unwrap());
         }
+        if self.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') {
+            panic!("a number can't be followed directly by a letter, at line {}", self.line);
+        }
+        let text = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
+        Token::IntLit(Self::parse_int(text, 10))
+    }
+
+    /// An integer up to 64 bits. Literals above `i64::MAX` keep their bit pattern.
+    fn parse_int(text: &str, radix: u32) -> i64 {
+        u64::from_str_radix(text, radix)
+            .unwrap_or_else(|_| panic!("integer literal '{}' doesn't fit in 64 bits", text)) as i64
     }
 
     fn read_char_lit(&mut self) -> Token {
@@ -325,6 +355,9 @@ impl<'a> Lexer<'a> {
                     if self.peek() == Some(b'/') {
                         self.advance();
                         Token::AmpSlash
+                    } else if self.peek() == Some(b'&') {
+                        self.advance();
+                        Token::AmpAmp
                     } else {
                         Token::Amp
                     }
@@ -334,6 +367,9 @@ impl<'a> Lexer<'a> {
                     if self.peek() == Some(b'/') {
                         self.advance();
                         Token::PipeSlash
+                    } else if self.peek() == Some(b'|') {
+                        self.advance();
+                        Token::PipePipe
                     } else {
                         Token::Pipe
                     }

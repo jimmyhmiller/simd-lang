@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Built by `tape_type`, which reads the discriminant out of the tape.
 pub enum TapeType {
     Root = 0,
     OpenObject = 1,

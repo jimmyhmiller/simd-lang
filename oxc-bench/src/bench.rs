@@ -197,7 +197,7 @@ pub fn litmask(path: &str, iters: usize) {
     let src = std::fs::read_to_string("examples/js_litmask.simd").unwrap();
     let ctx = codegen::create_context();
     let items = parser::parse(&src);
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new());
     codegen::lower_to_llvm(&ctx, &mut module).unwrap();
     let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
     let fptr = engine.lookup("js_litmask");
@@ -238,7 +238,7 @@ pub fn prof(path: &str, iters: usize) {
     let source = std::fs::read_to_string("examples/js_stage1.simd").unwrap();
     let ctx = codegen::create_context();
     let items = parser::parse(&source);
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new());
     codegen::lower_to_llvm(&ctx, &mut module).unwrap();
     let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
     let stage1: Stage1Fn = unsafe { std::mem::transmute(engine.lookup("js_stage1")) };
@@ -273,7 +273,7 @@ pub fn dump(path: &str) {
         .expect("cannot read examples/js_stage1.simd (run from project root)");
     let ctx = codegen::create_context();
     let items = parser::parse(&s1src);
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new());
     codegen::lower_to_llvm(&ctx, &mut module).expect("lowering failed");
     let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
     let fptr = engine.lookup("js_stage1");
@@ -282,7 +282,7 @@ pub fn dump(path: &str) {
     let nchunks = padded.len() / 64 + 1;
     let mut start_masks = vec![0u64; nchunks];
     let mut word_masks = vec![0u64; nchunks];
-    let n = {
+    let _token_starts = {
         let bits = stage1(
             padded.as_ptr(), padded.as_ptr(), 0, padded.len() as i64, 1,
             start_masks.as_mut_ptr(), start_masks.as_mut_ptr(), 0, start_masks.len() as i64, 1,
@@ -407,7 +407,7 @@ pub fn run(path: &str, iters: usize) {
         .expect("cannot read examples/js_stage1.simd (run from project root)");
     let ctx = codegen::create_context();
     let items = parser::parse(&source);
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new());
     codegen::lower_to_llvm(&ctx, &mut module).expect("lowering failed");
     let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
     let fptr = engine.lookup("js_stage1");

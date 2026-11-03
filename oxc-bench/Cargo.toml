@@ -1,0 +1,22 @@
+[package]
+name = "oxc-bench"
+version = "0.1.0"
+edition = "2024"
+
+# Compares the SIMD JavaScript lexer with oxc's. Kept apart from the compiler because
+# it needs a local oxc fork that widens next_regex and
+# next_template_substitution_tail to `pub`, so the lexer can run without oxc's parser.
+# Point the paths below at that fork.
+
+[[bin]]
+name = "oxc-bench"
+path = "src/main.rs"
+
+[dependencies]
+melior = "0.26"
+memchr = "2"
+oxc_allocator = { path = "/Users/jimmyhmiller/Documents/Code/open-source/oxc/crates/oxc_allocator" }
+oxc_span = { path = "/Users/jimmyhmiller/Documents/Code/open-source/oxc/crates/oxc_span" }
+oxc_parser = { path = "/Users/jimmyhmiller/Documents/Code/open-source/oxc/crates/oxc_parser", features = ["benchmarking"] }
+
+[workspace]

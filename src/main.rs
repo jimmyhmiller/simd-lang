@@ -1,12 +1,11 @@
 mod ast;
-#[cfg(feature = "bench")]
-mod bench;
 mod codegen;
-mod js;
+mod comptime;
+mod desugar;
+#[cfg(test)]
 mod json;
 mod lexer;
 mod parser;
-mod stage1;
 mod typecheck;
 
 use melior::ir::operation::OperationLike;
@@ -14,10 +13,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn main() {
+    // The compiler reports errors in programs by panicking with a message, so print just
+    // that. RUST_BACKTRACE=1 restores the full report, for debugging the compiler itself.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::panic::set_hook(Box::new(|info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| info.to_string());
+            eprintln!("error: {}", message);
+        }));
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>]");
+        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>] [--target <triple>] [--cpu <cpu>]");
         eprintln!("       simd-lang compile <file.simd> --emit-mlir");
         std::process::exit(1);
     }
@@ -31,35 +44,6 @@ fn main() {
             });
             let iters = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200);
             cmd_jit_stage1(file, iters);
-        }
-        #[cfg(feature = "bench")]
-        "bench" => {
-            let file = args.get(2).map(String::as_str).unwrap_or_else(|| {
-                eprintln!("Usage: simd-lang bench <file.js> [iters]");
-                std::process::exit(1);
-            });
-            let iters = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(50);
-            bench::run(file, iters);
-        }
-        #[cfg(feature = "bench")]
-        "tokens" => {
-            let file = args.get(2).map(String::as_str).unwrap_or_else(|| {
-                eprintln!("Usage: simd-lang tokens <file.js>");
-                std::process::exit(1);
-            });
-            bench::dump(file);
-        }
-        #[cfg(feature = "bench")]
-        "prof" => {
-            let file = args.get(2).map(String::as_str).unwrap();
-            let iters = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3000);
-            bench::prof(file, iters);
-        }
-        #[cfg(feature = "bench")]
-        "litmask" => {
-            let file = args.get(2).map(String::as_str).unwrap();
-            let iters = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
-            bench::litmask(file, iters);
         }
         other => {
             eprintln!("Unknown command: {}", other);
@@ -100,7 +84,7 @@ fn cmd_jit_stage1(path: &str, iters: usize) {
     let t_compile = Instant::now();
     let ctx = codegen::create_context();
     let items = parser::parse(&source);
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new());
     codegen::lower_to_llvm(&ctx, &mut module).expect("lowering failed");
     let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
     let fptr = engine.lookup("js_stage1");
@@ -146,7 +130,7 @@ fn cmd_jit_stage1(path: &str, iters: usize) {
 
 fn cmd_compile(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>] [--emit-mlir]");
+        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>] [--emit-mlir] [--target <triple>] [--cpu <cpu>]");
         std::process::exit(1);
     }
 
@@ -160,6 +144,8 @@ fn cmd_compile(args: &[String]) {
 
     let mut output_dir = PathBuf::from(".");
     let mut emit_mlir = false;
+    let mut triple = codegen::Arch::host_triple().to_string();
+    let mut cpu: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -170,6 +156,14 @@ fn cmd_compile(args: &[String]) {
             }
             "--emit-mlir" => {
                 emit_mlir = true;
+            }
+            "--target" => {
+                i += 1;
+                triple = args[i].clone();
+            }
+            "--cpu" => {
+                i += 1;
+                cpu = Some(args[i].clone());
             }
             other => {
                 eprintln!("Unknown option: {}", other);
@@ -185,11 +179,16 @@ fn cmd_compile(args: &[String]) {
         std::process::exit(1);
     });
 
+    let arch = codegen::Arch::of_triple(&triple).unwrap_or_else(|| {
+        eprintln!("Unsupported target: {} (expected aarch64-* or x86_64-*)", triple);
+        std::process::exit(1);
+    });
+
     // Parse
     let items = parser::parse(&source);
 
     // Type check
-    if let Err(errors) = typecheck::typecheck(&items, &HashMap::new(), 8) {
+    if let Err(errors) = typecheck::typecheck_for(&items, &HashMap::new(), arch) {
         for e in &errors {
             eprintln!("{}: {}", input_path.display(), e);
         }
@@ -198,7 +197,7 @@ fn cmd_compile(args: &[String]) {
 
     // Compile to MLIR
     let ctx = codegen::create_context();
-    let mut module = codegen::compile_module(&ctx, &items, &HashMap::new(), 8);
+    let mut module = codegen::compile_module_for(&ctx, &items, &HashMap::new(), arch);
 
     if !module.as_operation().verify() {
         eprintln!("MLIR verification failed:");
@@ -212,7 +211,7 @@ fn cmd_compile(args: &[String]) {
     }
 
     // Lower to LLVM
-    codegen::lower_to_llvm(&ctx, &mut module).unwrap_or_else(|e| {
+    codegen::lower_to_llvm_for(&ctx, &mut module, &triple).unwrap_or_else(|e| {
         eprintln!("LLVM lowering failed: {}", e);
         std::process::exit(1);
     });
@@ -227,19 +226,23 @@ fn cmd_compile(args: &[String]) {
     // ExecutionEngine: the JIT uses the large code model, where every constant-pool
     // and table access goes through the GOT, and it adds a `_mlir_` wrapper per fn.
     let obj_path = output_dir.join(format!("{}.o", stem));
-    compile_to_object(&module, &output_dir, &stem, &obj_path).unwrap_or_else(|e| {
+    compile_to_object(&module, &output_dir, &stem, &obj_path, &triple, arch, cpu.as_deref()).unwrap_or_else(|e| {
         eprintln!("object generation failed: {}", e);
         std::process::exit(1);
     });
 
     // Archive into static library
     let lib_path = output_dir.join(format!("lib{}.a", stem));
-    let status = std::process::Command::new("ar")
+    let archiver = llvm_tool("llvm-ar");
+    let status = std::process::Command::new(&archiver)
         .args(["rcs", lib_path.to_str().unwrap(), obj_path.to_str().unwrap()])
         .status()
-        .expect("failed to run ar");
+        .unwrap_or_else(|e| {
+            eprintln!("cannot run {}: {}", archiver.display(), e);
+            std::process::exit(1);
+        });
     if !status.success() {
-        eprintln!("ar failed");
+        eprintln!("{} failed", archiver.display());
         std::process::exit(1);
     }
 
@@ -258,7 +261,8 @@ fn cmd_compile(args: &[String]) {
 
 /// The LLVM install matching the MLIR this compiler links against.
 fn llvm_tool(name: &str) -> PathBuf {
-    let prefix = option_env!("MLIR_SYS_210_PREFIX").unwrap_or("/opt/homebrew/opt/llvm@21");
+    let default = if cfg!(target_os = "macos") { "/opt/homebrew/opt/llvm@21" } else { "/usr/lib/llvm-21" };
+    let prefix = option_env!("MLIR_SYS_210_PREFIX").unwrap_or(default);
     PathBuf::from(prefix).join("bin").join(name)
 }
 
@@ -268,6 +272,9 @@ fn compile_to_object(
     output_dir: &std::path::Path,
     stem: &str,
     obj_path: &std::path::Path,
+    triple: &str,
+    arch: codegen::Arch,
+    cpu: Option<&str>,
 ) -> Result<(), String> {
     let mlir_path = output_dir.join(format!("{}.llvm.mlir", stem));
     let ll_path = output_dir.join(format!("{}.ll", stem));
@@ -290,13 +297,19 @@ fn compile_to_object(
         "mlir-translate",
         &["--mlir-to-llvmir", mlir_path.to_str().unwrap(), "-o", ll_path.to_str().unwrap()],
     )?;
-    run(
-        "clang",
-        &[
-            "-x", "ir", "-O3", "-mcpu=apple-m1", "-Wno-override-module",
-            "-c", ll_path.to_str().unwrap(), "-o", obj_path.to_str().unwrap(),
-        ],
-    )?;
+    let target_arg = format!("--target={}", triple);
+    let cpu_args: Vec<String> = match (arch, cpu) {
+        (codegen::Arch::Aarch64, Some(cpu)) => vec![format!("-mcpu={}", cpu)],
+        (codegen::Arch::Aarch64, None) if triple.contains("apple") => vec!["-mcpu=apple-m1".to_string()],
+        (codegen::Arch::Aarch64, None) => vec![],
+        (codegen::Arch::X86_64, Some(cpu)) => vec![format!("-march={}", cpu)],
+        // The instructions `Arch::X86_64` promises.
+        (codegen::Arch::X86_64, None) => vec!["-march=x86-64-v3".to_string(), "-mpclmul".to_string()],
+    };
+    let mut clang_args = vec!["-x", "ir", "-O3", "-Wno-override-module", target_arg.as_str()];
+    clang_args.extend(cpu_args.iter().map(String::as_str));
+    clang_args.extend(["-c", ll_path.to_str().unwrap(), "-o", obj_path.to_str().unwrap()]);
+    run("clang", &clang_args)?;
     if std::env::var_os("SIMD_LANG_KEEP_IR").is_none() {
         let _ = std::fs::remove_file(&mlir_path);
         let _ = std::fs::remove_file(&ll_path);
@@ -319,7 +332,7 @@ fn generate_rust_bindings(module_name: &str, items: &[ast::Item]) -> String {
     let fns: Vec<&ast::FnDef> = items
         .iter()
         .filter_map(|item| match item {
-            ast::Item::Fn(f) if !f.private => Some(f),
+            ast::Item::Fn(f) if !f.private && f.comptime_params.is_empty() && has_binding(f) => Some(f),
             _ => None,
         })
         .collect();
@@ -351,6 +364,13 @@ fn generate_rust_bindings(module_name: &str, items: &[ast::Item]) -> String {
     }
 
     out
+}
+
+/// Pointers and structs come back through memory, which has no plain Rust signature.
+fn has_binding(f: &ast::FnDef) -> bool {
+    f.ret_ty.as_ref().is_none_or(|ret| {
+        matches!(ret.name.as_str(), "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "bool")
+    })
 }
 
 /// Determine whether a parameter is a ptr type (memref) or a vector type.

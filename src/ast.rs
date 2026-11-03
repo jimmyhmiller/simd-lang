@@ -62,6 +62,7 @@ impl Width {
     }
 
     /// Returns true if this width is fully concrete (no params, no native).
+    #[cfg(test)]
     pub fn is_concrete(&self) -> bool {
         match self {
             Width::Fixed(_) => true,
@@ -72,6 +73,7 @@ impl Width {
     }
 
     /// Collect all comptime parameter names referenced in this width.
+    #[cfg(test)]
     pub fn params(&self) -> Vec<String> {
         match self {
             Width::Fixed(_) | Width::Native => vec![],
@@ -250,6 +252,10 @@ pub enum StmtKind {
         value: Expr,
     },
     Return(Expr),
+    /// `return` from a function with no return type. Desugared unless it's last.
+    ReturnVoid,
+    /// Leaves the innermost `while`. Always desugared.
+    Break,
     Expr(Expr),
     Stream {
         chunk_name: String,
@@ -290,6 +296,17 @@ pub enum Expr {
     BoolLit(bool),
     CharLit(char),
     Ident(String),
+    /// `a && b` or `a || b` on scalar bools: `b` runs only if needed.
+    Logical {
+        op: LogicalOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// A generic function with explicit widths, as called: `f[32](x)`.
+    Instantiate {
+        name: String,
+        widths: Vec<Width>,
+    },
 
     /// [type: val, val, ...] — constant vector literal
     VecLit {
@@ -385,6 +402,194 @@ pub enum BinOp {
     Xor,
     BitShl,
     BitShr,
+}
+
+/// The value of an expression made only of literals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl Expr {
+    /// Evaluate a constant expression like `0 - 1`, `1 << 4` or `16 > 8`, in no particular
+    /// type. `None` if it isn't constant, or if it overflows or divides by zero. Bit
+    /// patterns depend on the type, so use `eval_int` when the type is known.
+    pub fn const_value(&self) -> Option<ConstValue> {
+        use ConstValue::{Bool, Float, Int};
+        match self {
+            Expr::IntLit(n) => Some(Int(*n)),
+            Expr::CharLit(c) => Some(Int(*c as i64)),
+            Expr::FloatLit(f) => Some(Float(*f)),
+            Expr::BoolLit(b) => Some(Bool(*b)),
+            Expr::UnaryOp { op, operand } => match (op, operand.const_value()?) {
+                (UnaryOp::Neg, Int(n)) => n.checked_neg().map(Int),
+                (UnaryOp::Neg, Float(f)) => Some(Float(-f)),
+                (UnaryOp::Not, Int(n)) => Some(Int(!n)),
+                (UnaryOp::Not, Bool(b)) => Some(Bool(!b)),
+                _ => None,
+            },
+            Expr::Logical { op, lhs, rhs } => match (op, lhs.const_value()?, rhs.const_value()?) {
+                (LogicalOp::And, Bool(a), Bool(b)) => Some(Bool(a && b)),
+                (LogicalOp::Or, Bool(a), Bool(b)) => Some(Bool(a || b)),
+                _ => None,
+            },
+            Expr::BinOp { op, lhs, rhs } => match (lhs.const_value()?, rhs.const_value()?) {
+                (Int(a), Int(b)) => match op {
+                    BinOp::Add => a.checked_add(b).map(Int),
+                    BinOp::Sub => a.checked_sub(b).map(Int),
+                    BinOp::Mul => a.checked_mul(b).map(Int),
+                    BinOp::Div => a.checked_div(b).map(Int),
+                    BinOp::And => Some(Int(a & b)),
+                    BinOp::Or => Some(Int(a | b)),
+                    BinOp::Xor => Some(Int(a ^ b)),
+                    BinOp::BitShl => u32::try_from(b).ok().and_then(|b| a.checked_shl(b)).map(Int),
+                    BinOp::BitShr => u32::try_from(b).ok().and_then(|b| a.checked_shr(b)).map(Int),
+                    BinOp::Gt => Some(Bool(a > b)),
+                    BinOp::Lt => Some(Bool(a < b)),
+                    BinOp::GtEq => Some(Bool(a >= b)),
+                    BinOp::LtEq => Some(Bool(a <= b)),
+                    BinOp::EqEq => Some(Bool(a == b)),
+                    BinOp::NotEq => Some(Bool(a != b)),
+                },
+                (Float(a), Float(b)) => match op {
+                    BinOp::Add => Some(Float(a + b)),
+                    BinOp::Sub => Some(Float(a - b)),
+                    BinOp::Mul => Some(Float(a * b)),
+                    BinOp::Div => Some(Float(a / b)),
+                    BinOp::Gt => Some(Bool(a > b)),
+                    BinOp::Lt => Some(Bool(a < b)),
+                    BinOp::GtEq => Some(Bool(a >= b)),
+                    BinOp::LtEq => Some(Bool(a <= b)),
+                    BinOp::EqEq => Some(Bool(a == b)),
+                    BinOp::NotEq => Some(Bool(a != b)),
+                    _ => None,
+                },
+                (Bool(a), Bool(b)) => match op {
+                    BinOp::And => Some(Bool(a & b)),
+                    BinOp::Or => Some(Bool(a | b)),
+                    BinOp::Xor => Some(Bool(a ^ b)),
+                    BinOp::EqEq => Some(Bool(a == b)),
+                    BinOp::NotEq => Some(Bool(a != b)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Evaluate a constant integer expression as a `bits`-wide integer, so `~0 >> 4` is 15
+    /// as a `u8`. Literals must fit, in either reading of their bits.
+    pub fn eval_int(&self, bits: u32, signed: bool) -> Result<i64, String> {
+        Ok(self.eval_wrapped(bits, signed)? as i64)
+    }
+
+    fn eval_wrapped(&self, bits: u32, signed: bool) -> Result<i128, String> {
+        let wrap = |value: i128| -> i128 {
+            let unsigned = value & ((1i128 << bits) - 1);
+            if signed && unsigned >> (bits - 1) != 0 { unsigned - (1i128 << bits) } else { unsigned }
+        };
+        let leaf = |n: i64| -> Result<i128, String> {
+            if bits < 64 && (n < -(1i64 << (bits - 1)) || n >= (1i64 << bits)) {
+                return Err(format!("literal {} doesn't fit in {} bits", n, bits));
+            }
+            Ok(wrap(n as i128))
+        };
+        let not_constant = || "not an integer constant".to_string();
+        match self {
+            Expr::IntLit(n) => leaf(*n),
+            Expr::CharLit(c) => leaf(*c as i64),
+            Expr::UnaryOp { op, operand } => {
+                let value = operand.eval_wrapped(bits, signed)?;
+                Ok(wrap(match op {
+                    UnaryOp::Neg => -value,
+                    UnaryOp::Not => !value,
+                }))
+            }
+            Expr::BinOp { op, lhs, rhs } => {
+                let a = lhs.eval_wrapped(bits, signed)?;
+                if matches!(op, BinOp::BitShl | BinOp::BitShr) {
+                    let amount = match rhs.const_value() {
+                        Some(ConstValue::Int(n)) => n,
+                        _ => return Err(not_constant()),
+                    };
+                    if amount < 0 || amount >= bits as i64 {
+                        return Err(format!("shift by {} is out of range for {} bits", amount, bits));
+                    }
+                    return Ok(wrap(if *op == BinOp::BitShl { a << amount } else { a >> amount }));
+                }
+                let b = rhs.eval_wrapped(bits, signed)?;
+                Ok(wrap(match op {
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    BinOp::Div if b == 0 => return Err("division by zero".to_string()),
+                    BinOp::Div => a / b,
+                    BinOp::And => a & b,
+                    BinOp::Or => a | b,
+                    BinOp::Xor => a ^ b,
+                    _ => return Err(not_constant()),
+                }))
+            }
+            _ => Err(not_constant()),
+        }
+    }
+}
+
+/// Whether a name is one of the desugaring pass's flags.
+fn is_escape_flag(name: &str) -> bool {
+    name == "__returned" || name.starts_with("__break_")
+}
+
+/// Whether these statements, as desugaring left them, always end by setting an escape
+/// flag. Nothing after them runs, so they needn't define what the other side of an `if`
+/// defines.
+pub fn always_sets_escape_flag(stmts: &[Stmt]) -> bool {
+    match stmts.last().map(|s| &s.kind) {
+        Some(StmtKind::Assign { target: AssignTarget::Ident(name), value: Expr::BoolLit(true), .. }) => {
+            is_escape_flag(name)
+        }
+        Some(StmtKind::If { then_body, else_body, .. }) => {
+            always_sets_escape_flag(then_body) && always_sets_escape_flag(else_body)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a condition tests only that no escape flag is set, as desugaring's guards do.
+pub fn is_escape_guard(cond: &Expr) -> bool {
+    match cond {
+        Expr::UnaryOp { op: UnaryOp::Not, operand } => {
+            matches!(operand.as_ref(), Expr::Ident(name) if is_escape_flag(name))
+        }
+        Expr::Logical { op: LogicalOp::And, lhs, rhs } => is_escape_guard(lhs) && is_escape_guard(rhs),
+        _ => false,
+    }
+}
+
+/// Whether each side of an `if` can continue to the code after it. A name defined only on
+/// the side that continues is visible afterwards.
+pub fn sides_that_continue(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt]) -> (bool, bool) {
+    let else_is_escaped = else_body.is_empty() && is_escape_guard(cond);
+    (!always_sets_escape_flag(then_body), !always_sets_escape_flag(else_body) && !else_is_escaped)
+}
+
+/// Names the language defines. Functions can't reuse them.
+pub const BUILTINS: &[&str] = &[
+    "any", "any_in_first", "bit_shl", "bit_shr", "bswap", "clear_lowest_bit", "clmul", "compress",
+    "compressstore", "concat", "ctz", "extract", "fold_min", "from_bitmask", "gather", "iota",
+    "lane_shl", "lane_shr", "likely", "load", "load_at", "loadu", "mask8", "max", "min",
+    "nibblemask", "popcount", "ptr_add", "ptr_addr", "scan_dfa", "shuffle", "split_hi", "split_lo",
+    "sqrt", "store", "store_at", "tbl", "to_bitmask", "to_i16", "to_i32", "to_i64", "to_i8",
+    "to_u16", "to_u32", "to_u64", "to_u8", "unlikely", "xor",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LogicalOp {
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

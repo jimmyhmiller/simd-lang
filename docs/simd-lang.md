@@ -1,5 +1,8 @@
 # SIMD Language Design Doc
 
+> This is the original design. The language has since gained real branches, loops and
+> scalars; the README describes what the compiler does today.
+
 A low-level kernel language where SIMD is the primitive, not an optimization target.
 Every construct maps directly to a SIMD operation. No scalar variables, no loops,
 no implicit broadcasting.
