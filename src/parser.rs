@@ -67,10 +67,41 @@ impl Parser {
             match self.peek() {
                 Token::Struct => items.push(Item::Struct(self.parse_struct_def())),
                 Token::Fn => items.push(Item::Fn(self.parse_fn_def())),
-                other => panic!("expected 'struct' or 'fn', got {:?}", other),
+                Token::Const => items.push(Item::Const(self.parse_const_def())),
+                Token::NoInline | Token::Private | Token::Extern => {
+                    let (mut noinline, mut private, mut extern_c) = (false, false, false);
+                    loop {
+                        match self.peek() {
+                            Token::NoInline => noinline = true,
+                            Token::Private => private = true,
+                            Token::Extern => extern_c = true,
+                            _ => break,
+                        }
+                        self.pos += 1;
+                    }
+                    if private && extern_c {
+                        panic!("a function can't be both private and extern");
+                    }
+                    let mut def = self.parse_fn_def();
+                    def.noinline = noinline;
+                    def.private = private;
+                    def.extern_c = extern_c;
+                    items.push(Item::Fn(def));
+                }
+                other => panic!("expected 'struct', 'fn', 'noinline', 'private', 'extern' or 'const', got {:?}", other),
             }
         }
         items
+    }
+
+    fn parse_const_def(&mut self) -> ConstDef {
+        self.expect(&Token::Const);
+        let name = self.expect_ident();
+        self.expect(&Token::Eq);
+        match self.parse_vec_lit() {
+            Expr::VecLit { elem_type, values } => ConstDef { name, elem_type, values },
+            other => panic!("const '{}' must be a vector literal, got {:?}", name, other),
+        }
     }
 
     fn parse_comptime_params(&mut self) -> Vec<ComptimeParam> {
@@ -159,6 +190,9 @@ impl Parser {
         self.expect(&Token::RBrace);
 
         FnDef {
+            noinline: false,
+            private: false,
+            extern_c: false,
             name,
             comptime_params,
             params,
@@ -1875,6 +1909,9 @@ mod tests {
         assert_eq!(
             items,
             vec![Item::Fn(FnDef {
+                noinline: false,
+                private: false,
+            extern_c: false,
                 name: "noop".into(),
                 comptime_params: vec![],
                 params: vec![],
@@ -1890,6 +1927,9 @@ mod tests {
         assert_eq!(
             items,
             vec![Item::Fn(FnDef {
+                noinline: false,
+                private: false,
+            extern_c: false,
                 name: "add".into(),
                 comptime_params: vec![],
                 params: vec![
@@ -1920,6 +1960,9 @@ mod tests {
         assert_eq!(
             items,
             vec![Item::Fn(FnDef {
+                noinline: false,
+                private: false,
+            extern_c: false,
                 name: "dot".into(),
                 comptime_params: vec![cparam("N")],
                 params: vec![

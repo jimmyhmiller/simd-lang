@@ -8,7 +8,7 @@ use std::time::Instant;
 extern "C" {
     fn build_directory(
         buf_alloc: *const u8, buf_align: *const u8, buf_offset: i64, buf_size: i64, buf_stride: i64,
-        buf_len: f64,
+        buf_len: i64,
         class_ids_alloc: *mut i64, class_ids_align: *mut i64, class_ids_offset: i64, class_ids_size: i64, class_ids_stride: i64,
         offsets_alloc: *mut i64, offsets_align: *mut i64, offsets_offset: i64, offsets_size: i64, offsets_stride: i64,
         lengths_alloc: *mut i64, lengths_align: *mut i64, lengths_offset: i64, lengths_size: i64, lengths_stride: i64,
@@ -18,7 +18,7 @@ extern "C" {
 
     fn find_and_count(
         buf_alloc: *const u8, buf_align: *const u8, buf_offset: i64, buf_size: i64, buf_stride: i64,
-        buf_len: f64, name_w1: f64, name_w2: f64, name_len: f64,
+        buf_len: i64, name_w1: i64, name_w2: i64, name_len: i64,
         out_alloc: *mut i64, out_align: *mut i64, out_offset: i64, out_size: i64, out_stride: i64,
     );
 }
@@ -98,8 +98,8 @@ fn main() {
     unsafe {
         find_and_count(
             mmap.as_ptr(), mmap.as_ptr(), 0, len as i64, 1,
-            f64::from_bits(len as u64), f64::from_bits(w1), f64::from_bits(w2),
-            f64::from_bits(class_name.len() as u64),
+            (len as u64) as i64, (w1) as i64, (w2) as i64,
+            (class_name.len() as u64) as i64,
             out1.as_mut_ptr(), out1.as_mut_ptr(), 0, 2, 1,
         );
     }
@@ -125,7 +125,7 @@ fn main() {
         let (da, db, d_o, ds, dt) = memref(dir_out.as_mut_ptr(), 1);
         build_directory(
             mmap.as_ptr(), mmap.as_ptr(), 0, len as i64, 1,
-            f64::from_bits(len as u64),
+            (len as u64) as i64,
             ca, cb, co, cs, ct,
             oa, ob, oo, os, ot,
             la, lb, lo, ls, lt,

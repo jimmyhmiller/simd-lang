@@ -139,10 +139,13 @@ struct FnSig {
 }
 
 struct TypeChecker {
+    /// Pointers whose size is unknown: the parameters of the current `extern fn`.
+    unsized_ptrs: Vec<String>,
     errors: Vec<TypeError>,
     vars: HashMap<String, CheckedType>,
     struct_defs: HashMap<String, ast::StructDef>,
     fn_sigs: HashMap<String, FnSig>,
+    consts: HashMap<String, ScalarType>,
     comptime_env: HashMap<String, u64>,
     native_width: u64,
     current_span: ast::Span,
@@ -152,10 +155,12 @@ struct TypeChecker {
 impl TypeChecker {
     fn new(comptime_env: &HashMap<String, u64>, native_width: u64) -> Self {
         TypeChecker {
+            unsized_ptrs: Vec::new(),
             errors: Vec::new(),
             vars: HashMap::new(),
             struct_defs: HashMap::new(),
             fn_sigs: HashMap::new(),
+            consts: HashMap::new(),
             comptime_env: comptime_env.clone(),
             native_width,
             current_span: ast::Span::dummy(),
@@ -174,6 +179,14 @@ impl TypeChecker {
 
     fn check_fn(&mut self, f: &ast::FnDef) {
         self.vars.clear();
+        self.unsized_ptrs = if f.extern_c {
+            f.params.iter().filter(|p| is_ptr_type_name(&p.ty.name)).map(|p| p.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        for (name, scalar) in &self.consts {
+            self.vars.insert(name.clone(), CheckedType::Ptr(*scalar));
+        }
 
         // Bind params
         for p in &f.params {
@@ -235,6 +248,16 @@ impl TypeChecker {
     }
 
     // ─── Statement checking ───
+
+    /// `return` is only meaningful as a function's final statement.
+    fn check_no_return(&mut self, body: &[ast::Stmt]) {
+        for stmt in body {
+            if matches!(stmt.kind, ast::StmtKind::Return(_)) {
+                self.current_span = stmt.span;
+                self.err("return is not supported inside if or while".to_string());
+            }
+        }
+    }
 
     fn check_stmt(&mut self, stmt: &ast::Stmt) {
         self.current_span = stmt.span;
@@ -342,11 +365,35 @@ impl TypeChecker {
                         self.err("if condition must be width 1 (scalar bool)".to_string());
                     }
                 }
+                self.check_no_return(then_body);
+                self.check_no_return(else_body);
+
+                // Each branch sees the variables from before the `if`, and only
+                // the taken branch runs. Afterwards a variable keeps its binding if
+                // it existed before; a new name is visible only if both branches
+                // define it.
+                let before = self.vars.clone();
                 for stmt in then_body {
                     self.check_stmt(stmt);
                 }
+                let then_vars = std::mem::replace(&mut self.vars, before.clone());
                 for stmt in else_body {
                     self.check_stmt(stmt);
+                }
+                let else_vars = std::mem::replace(&mut self.vars, before.clone());
+
+                for (name, then_ty) in &then_vars {
+                    if let Some(else_ty) = else_vars.get(name) {
+                        if let (CheckedType::Vec(t), CheckedType::Vec(e)) = (then_ty, else_ty) {
+                            if t.width != e.width {
+                                self.err(format!(
+                                    "variable '{}' has width {} in one branch of an if and {} in the other",
+                                    name, t.width, e.width
+                                ));
+                            }
+                        }
+                        self.vars.insert(name.clone(), then_ty.clone());
+                    }
                 }
             }
             ast::StmtKind::While { cond, body } => {
@@ -359,6 +406,7 @@ impl TypeChecker {
                         self.err("while condition must be width 1 (scalar bool)".to_string());
                     }
                 }
+                self.check_no_return(body);
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
@@ -371,6 +419,12 @@ impl TypeChecker {
                 body,
                 carry_updates,
             } => {
+                if self.unsized_ptrs.contains(buffer) {
+                    self.err(format!(
+                        "cannot stream over '{}': an extern fn's pointers have no known size",
+                        buffer
+                    ));
+                }
                 // Check buffer is ptr
                 if let Some(bty) = self.vars.get(buffer) {
                     if !matches!(bty, CheckedType::Ptr(_)) {
@@ -724,15 +778,25 @@ impl TypeChecker {
         lhs: &ast::Expr,
         rhs: &ast::Expr,
     ) -> CheckedType {
-        // Bit shifts: RHS must be an int literal
+        // Bit shifts: the amount is a literal, a scalar, or matches the operand's width
         if op == ast::BinOp::BitShl || op == ast::BinOp::BitShr {
-            if !matches!(rhs, ast::Expr::IntLit(_)) {
-                self.err("bit shift amount must be an integer literal".to_string());
-            }
             let lty = self.infer_expr(lhs);
             if let CheckedType::Vec(vt) = &lty {
                 if vt.scalar.is_float() {
                     self.err("bit shift requires integer type".to_string());
+                }
+            }
+            if !matches!(rhs, ast::Expr::IntLit(_)) {
+                let rty = self.infer_expr(rhs);
+                if let (CheckedType::Vec(lv), CheckedType::Vec(rv)) = (&lty, &rty) {
+                    if !rv.scalar.is_int() {
+                        self.err("bit shift amount must be an integer".to_string());
+                    } else if rv.width != 1 && rv.width != lv.width {
+                        self.err(format!(
+                            "bit shift amount width {} does not match operand width {}",
+                            rv.width, lv.width
+                        ));
+                    }
                 }
             }
             return lty;
@@ -1033,6 +1097,76 @@ impl TypeChecker {
                     }
                 }
             }
+            "unlikely" => {
+                self.check_arg_count(fname, args, 1);
+                let aty = self.infer_arg(args, 0);
+                if !matches!(&aty, CheckedType::Vec(vt) if vt.scalar == ScalarType::Bool && vt.width == 1) {
+                    self.err(format!("unlikely requires a scalar bool, got {}", aty.describe()));
+                }
+                aty
+            }
+            "to_u8" => {
+                self.check_arg_count(fname, args, 1);
+                match self.infer_arg(args, 0) {
+                    CheckedType::Vec(vt) => CheckedType::Vec(VecType { scalar: ScalarType::U8, width: vt.width }),
+                    other => other,
+                }
+            }
+            "min" | "max" => {
+                self.check_arg_count(fname, args, 2);
+                let aty = self.infer_arg(args, 0);
+                if !is_literal(&args[1].value) {
+                    let bty = self.infer_arg(args, 1);
+                    if let (CheckedType::Vec(a), CheckedType::Vec(b)) = (&aty, &bty) {
+                        if a.width != b.width {
+                            self.err(format!("{} operands have different widths: {} vs {}", fname, a.width, b.width));
+                        }
+                    }
+                }
+                aty
+            }
+            "mask8" => {
+                self.check_arg_count(fname, args, 1);
+                match self.infer_arg(args, 0) {
+                    CheckedType::Vec(vt) if vt.scalar == ScalarType::Bool => {
+                        CheckedType::Vec(VecType { scalar: ScalarType::U8, width: vt.width })
+                    }
+                    other => {
+                        self.err(format!("mask8 requires a bool vector, got {}", other.describe()));
+                        other
+                    }
+                }
+            }
+            "nibblemask" => {
+                self.check_arg_count(fname, args, 1);
+                let aty = self.infer_arg(args, 0);
+                if !matches!(&aty, CheckedType::Vec(vt) if vt.width == 16 && vt.scalar == ScalarType::U8) {
+                    self.err(format!("nibblemask requires a u8[16], got {}", aty.describe()));
+                }
+                CheckedType::Vec(VecType { scalar: ScalarType::U64, width: 1 })
+            }
+            "concat" => {
+                self.check_arg_count(fname, args, 2);
+                let aty = self.infer_arg(args, 0);
+                let bty = self.infer_arg(args, 1);
+                match (&aty, &bty) {
+                    (CheckedType::Vec(a), CheckedType::Vec(b)) if a.scalar == b.scalar && a.width == b.width && a.width > 1 => {
+                        CheckedType::Vec(VecType { scalar: a.scalar, width: a.width * 2 })
+                    }
+                    _ => {
+                        self.err(format!("concat requires two vectors of the same type, got {} and {}", aty.describe(), bty.describe()));
+                        aty
+                    }
+                }
+            }
+            "ptr_addr" => {
+                self.check_arg_count(fname, args, 1);
+                let aty = self.infer_arg(args, 0);
+                if !matches!(aty, CheckedType::Ptr(_)) {
+                    self.err(format!("ptr_addr requires a pointer, got {}", aty.describe()));
+                }
+                CheckedType::Vec(VecType { scalar: ScalarType::I64, width: 1 })
+            }
             "any" => {
                 self.check_arg_count(fname, args, 1);
                 let _ = self.infer_arg(args, 0);
@@ -1180,6 +1314,17 @@ pub fn typecheck(
     for item in items {
         if let ast::Item::Struct(sd) = item {
             checker.struct_defs.insert(sd.name.clone(), sd.clone());
+        }
+    }
+
+    // Const tables are visible in every function as pointers
+    for item in items {
+        if let ast::Item::Const(c) = item {
+            if !is_scalar_type_name(&c.elem_type) {
+                checker.err(format!("const '{}' has unknown element type: {}", c.name, c.elem_type));
+                continue;
+            }
+            checker.consts.insert(c.name.clone(), ScalarType::from_name(&c.elem_type));
         }
     }
 

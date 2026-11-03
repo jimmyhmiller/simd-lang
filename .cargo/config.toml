@@ -1,0 +1,5 @@
+# mlir-sys / tblgen need an LLVM whose major version matches melior's (21).
+# Homebrew's default `llvm` moves on, so pin the versioned keg explicitly.
+[env]
+MLIR_SYS_210_PREFIX = "/opt/homebrew/opt/llvm@21"
+TABLEGEN_210_PREFIX = "/opt/homebrew/opt/llvm@21"

@@ -6,6 +6,7 @@ mod js;
 mod json;
 mod lexer;
 mod parser;
+mod stage1;
 mod typecheck;
 
 use melior::ir::operation::OperationLike;
@@ -79,7 +80,7 @@ fn cmd_jit_stage1(path: &str, iters: usize) {
         *const u8, *const u8, i64, i64, i64, // input       memref<?xi8>
         *mut u64, *mut u64, i64, i64, i64,   // start_masks memref<?xi64>
         *mut u64, *mut u64, i64, i64, i64,   // word_masks  memref<?xi64>
-    ) -> f32; // vector<1xi32> token-start count in s0
+    ) -> i32; // token-start count
 
     let raw = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("cannot read {path}: {e}");
@@ -112,12 +113,11 @@ fn cmd_jit_stage1(path: &str, iters: usize) {
     let mut word_masks = vec![0u64; nchunks];
 
     let call = |start: &mut [u64], word: &mut [u64]| -> i32 {
-        let bits = stage1(
+        stage1(
             padded.as_ptr(), padded.as_ptr(), 0, padded.len() as i64, 1,
             start.as_mut_ptr(), start.as_mut_ptr(), 0, start.len() as i64, 1,
             word.as_mut_ptr(), word.as_mut_ptr(), 0, word.len() as i64, 1,
-        );
-        f32::to_bits(bits) as i32
+        )
     };
 
     let token_starts = call(&mut start_masks, &mut word_masks);
@@ -223,17 +223,14 @@ fn cmd_compile(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Produce object file via ExecutionEngine.
-    //
-    // Opt level 3 — the same level the JIT path uses (`jit-stage1`), so the AOT
-    // artifact and the JIT version are compiled by an identical MLIR→LLVM
-    // pipeline and the only thing the benchmark measures is precompiled-vs-
-    // at-launch, not an opt-level difference. The default engine detects the
-    // host CPU (we get full NEON codegen on aarch64). `enable_object_dump = true`
-    // keeps the emitted object so `dump_to_object_file` has something to write.
+    // Produce the object file with the LLVM tools rather than the JIT's
+    // ExecutionEngine: the JIT uses the large code model, where every constant-pool
+    // and table access goes through the GOT, and it adds a `_mlir_` wrapper per fn.
     let obj_path = output_dir.join(format!("{}.o", stem));
-    let engine = melior::ExecutionEngine::new(&module, 3, &[], true);
-    engine.dump_to_object_file(obj_path.to_str().unwrap());
+    compile_to_object(&module, &output_dir, &stem, &obj_path).unwrap_or_else(|e| {
+        eprintln!("object generation failed: {}", e);
+        std::process::exit(1);
+    });
 
     // Archive into static library
     let lib_path = output_dir.join(format!("lib{}.a", stem));
@@ -259,6 +256,54 @@ fn cmd_compile(args: &[String]) {
     eprintln!("  {}", rs_path.display());
 }
 
+/// The LLVM install matching the MLIR this compiler links against.
+fn llvm_tool(name: &str) -> PathBuf {
+    let prefix = option_env!("MLIR_SYS_210_PREFIX").unwrap_or("/opt/homebrew/opt/llvm@21");
+    PathBuf::from(prefix).join("bin").join(name)
+}
+
+/// Lowered MLIR → LLVM IR (`mlir-translate`) → optimized object (`clang -O3`).
+fn compile_to_object(
+    module: &melior::ir::Module,
+    output_dir: &std::path::Path,
+    stem: &str,
+    obj_path: &std::path::Path,
+) -> Result<(), String> {
+    let mlir_path = output_dir.join(format!("{}.llvm.mlir", stem));
+    let ll_path = output_dir.join(format!("{}.ll", stem));
+    std::fs::write(&mlir_path, module.as_operation().to_string())
+        .map_err(|e| format!("cannot write {}: {}", mlir_path.display(), e))?;
+
+    let run = |tool: &str, args: &[&str]| -> Result<(), String> {
+        let path = llvm_tool(tool);
+        let status = std::process::Command::new(&path)
+            .args(args)
+            .status()
+            .map_err(|e| format!("cannot run {}: {}", path.display(), e))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{} failed: {}", path.display(), status))
+        }
+    };
+    run(
+        "mlir-translate",
+        &["--mlir-to-llvmir", mlir_path.to_str().unwrap(), "-o", ll_path.to_str().unwrap()],
+    )?;
+    run(
+        "clang",
+        &[
+            "-x", "ir", "-O3", "-mcpu=apple-m1", "-Wno-override-module",
+            "-c", ll_path.to_str().unwrap(), "-o", obj_path.to_str().unwrap(),
+        ],
+    )?;
+    if std::env::var_os("SIMD_LANG_KEEP_IR").is_none() {
+        let _ = std::fs::remove_file(&mlir_path);
+        let _ = std::fs::remove_file(&ll_path);
+    }
+    Ok(())
+}
+
 /// Generate safe Rust wrapper code for all functions in a .simd file.
 fn generate_rust_bindings(module_name: &str, items: &[ast::Item]) -> String {
     let mut out = String::new();
@@ -274,7 +319,7 @@ fn generate_rust_bindings(module_name: &str, items: &[ast::Item]) -> String {
     let fns: Vec<&ast::FnDef> = items
         .iter()
         .filter_map(|item| match item {
-            ast::Item::Fn(f) => Some(f),
+            ast::Item::Fn(f) if !f.private => Some(f),
             _ => None,
         })
         .collect();
@@ -347,7 +392,10 @@ fn build_extern_params(f: &ast::FnDef) -> (String, Vec<String>) {
     let mut param_names = Vec::new();
 
     for p in &f.params {
-        if is_ptr_param(p) {
+        if is_ptr_param(p) && f.extern_c {
+            params.push(format!("{}: *mut {}", p.name, scalar_to_rust(ptr_elem(p))));
+            param_names.push(p.name.clone());
+        } else if is_ptr_param(p) {
             let elem = ptr_elem(p);
             let rust_ty = scalar_to_rust(elem);
             let is_mut = true; // conservative: treat all ptrs as mut
@@ -381,9 +429,8 @@ fn vector_to_rust_type(ty: &ast::Type) -> String {
         _ => 1,
     };
     if width == 1 {
-        // Width-1 vectors are scalars in the ABI
-        // vector<1xi32> is passed in a NEON register as f32
-        "f32".to_string()
+        // Width-1 values are plain scalars in the ABI
+        scalar_to_rust(&ty.name).to_string()
     } else {
         // SIMD vectors — use fixed-size arrays for FFI
         // LLVM passes these in NEON registers
@@ -417,9 +464,6 @@ fn build_extern_return(f: &ast::FnDef) -> String {
 
 /// Generate a safe Rust wrapper function.
 fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
-    let has_ptr_params = f.params.iter().any(|p| is_ptr_param(p));
-    let has_return = f.ret_ty.is_some();
-
     // Build safe parameter list
     let mut safe_params = Vec::new();
     for p in &f.params {
@@ -437,16 +481,7 @@ fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
     let safe_ret = match &f.ret_ty {
         None => String::new(),
         Some(ty) => {
-            let width = match &ty.width {
-                Some(ast::Width::Fixed(n)) => *n,
-                _ => 1,
-            };
-            if width == 1 && !ty.name.starts_with('f') {
-                // vector<1xi32> returns as f32 in ABI, convert to actual type
-                format!(" -> {}", scalar_to_rust(&ty.name))
-            } else {
-                format!(" -> {}", vector_to_rust_type(ty))
-            }
+            format!(" -> {}", vector_to_rust_type(ty))
         }
     };
 
@@ -463,7 +498,9 @@ fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
     // Build call arguments
     let mut call_args = Vec::new();
     for p in &f.params {
-        if is_ptr_param(p) {
+        if is_ptr_param(p) && f.extern_c {
+            call_args.push(format!("{}.as_mut_ptr()", p.name));
+        } else if is_ptr_param(p) {
             call_args.push(format!("{}.as_mut_ptr()", p.name));
             call_args.push(format!("{}.as_mut_ptr()", p.name));
             call_args.push("0".to_string());
@@ -480,21 +517,8 @@ fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
         None => {
             out.push_str(&format!("        {};\n", call));
         }
-        Some(ty) => {
-            let width = match &ty.width {
-                Some(ast::Width::Fixed(n)) => *n,
-                _ => 1,
-            };
-            if width == 1 && !ty.name.starts_with('f') {
-                // vector<1xi32/u64/etc> returns as f32 bits
-                let target = scalar_to_rust(&ty.name);
-                out.push_str(&format!(
-                    "        f32::to_bits({}) as {}\n",
-                    call, target
-                ));
-            } else {
-                out.push_str(&format!("        {}\n", call));
-            }
+        Some(_) => {
+            out.push_str(&format!("        {}\n", call));
         }
     }
 

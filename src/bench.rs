@@ -136,7 +136,7 @@ type Stage1Fn = extern "C" fn(
     *const u8, *const u8, i64, i64, i64, // input       memref<?xi8>
     *mut u64, *mut u64, i64, i64, i64,   // start_masks memref<?xi64>
     *mut u64, *mut u64, i64, i64, i64,   // word_masks  memref<?xi64>
-) -> f32; // vector<1xi32> (token-start count) returned in s0
+) -> i32; // token-start count
 
 fn pad64(src: &[u8]) -> Vec<u8> {
     let mut v = src.to_vec();
@@ -288,7 +288,7 @@ pub fn dump(path: &str) {
             start_masks.as_mut_ptr(), start_masks.as_mut_ptr(), 0, start_masks.len() as i64, 1,
             word_masks.as_mut_ptr(), word_masks.as_mut_ptr(), 0, word_masks.len() as i64, 1,
         );
-        f32::to_bits(bits) as i32 as usize
+        bits as usize
     };
     let ours = js::tokenize(&raw, &start_masks, &word_masks);
 
@@ -424,7 +424,7 @@ pub fn run(path: &str, iters: usize) {
             start_masks.as_mut_ptr(), start_masks.as_mut_ptr(), 0, start_masks.len() as i64, 1,
             word_masks.as_mut_ptr(), word_masks.as_mut_ptr(), 0, word_masks.len() as i64, 1,
         );
-        f32::to_bits(bits) as i32 as usize
+        bits as usize
     };
 
     // sanity / token counts
