@@ -10,6 +10,10 @@ The whole thing is pretty rough around the edges. It was built iteratively as an
 
 ## Building & running
 
+The compiler needs LLVM/MLIR 21 (`brew install llvm@21`; `.cargo/config.toml` points
+the build at it). Compiling a `.simd` file also runs that install's `mlir-translate`
+and `clang`.
+
 ```bash
 # Compile a .simd file to a static library + Rust bindings
 cargo run --release -- compile examples/json_stage1.simd -o output/
@@ -23,7 +27,7 @@ cargo run --release -- compile examples/json_stage1.simd --emit-mlir
 
 ## The language
 
-Every value is a fixed-width vector. There are no scalar variables — a "scalar" is just a width-1 vector.
+Every value is a fixed-width vector, and a "scalar" is a width-1 vector. `T[1]` lowers to a plain machine scalar: integers live in general-purpose registers and are passed and returned as ordinary C integers.
 
 ```
 -- types
@@ -46,7 +50,7 @@ fn add(a: f32[8], b: f32[8]) -> f32[8] {
 
 All element-wise: `+` `-` `*` `/` `&` `|` `^` `~` `>>` `<<` `>` `<` `>=` `<=` `==` `!=`
 
-`>>` and `<<` are bit shifts. For sliding elements within a vector, use `lane_shr(v, n)` / `lane_shl(v, n)`.
+`>>` and `<<` are bit shifts, by a literal, a scalar, or per lane. For sliding elements within a vector, use `lane_shr(v, n)` / `lane_shl(v, n)`.
 
 ### Literals & broadcasting
 
@@ -153,7 +157,27 @@ if cond {
 }
 ```
 
-Both branches execute; variables assigned in both are merged with `select`.
+Only the taken branch runs, so stores inside it are conditional. Afterwards a variable holds its new value if either branch reassigned it; a name first defined inside the `if` is visible afterwards only if both branches define it. `return` must be a function's last statement.
+
+`while cond { ... }` is a real loop, and `unlikely(cond)` marks a condition as usually false so its path is laid out away from the hot path.
+
+### Const tables
+
+```
+const TABLE = [u8: 10, 20, 30, 40]
+```
+
+Read-only static data. Inside functions `TABLE` is a pointer.
+
+### Function kinds
+
+```
+private fn helper(...)          -- no exported symbol or binding; LLVM may rewrite its signature
+noinline private fn cold(...)   -- stays a call, keeping cold code and its constants off the hot path
+extern fn entry(p: ptr[u8], n: i64[1]) -> i64[1]   -- C ABI: `p` is a plain pointer
+```
+
+A normal function takes each `ptr[T]` as a five-word memref descriptor. An `extern fn` takes a plain pointer instead, so it doesn't know the size and can't `stream` over it.
 
 ### Structs
 
@@ -173,15 +197,15 @@ chars = input.[positions]          -- equivalent
 
 ## Builtins
 
-**Vector:** `iota(N)`, `extract(vec, lane)`, `compress(data, mask)`, `popcount(mask)`, `to_i32(vec)`, `sqrt(vec)`, `split_lo(vec)`, `split_hi(vec)`
+**Vector:** `iota(N)`, `extract(vec, lane)`, `compress(data, mask)`, `popcount(mask)`, `to_u8(vec)`, `to_i32(vec)`, `to_i64(vec)`, `sqrt(vec)`, `split_lo(vec)`, `split_hi(vec)`, `concat(a, b)`, `min(a, b)`, `max(a, b)`
 
 **Lane shift:** `lane_shr(v, n)`, `lane_shl(v, n)`
 
-**Bitmask:** `to_bitmask(bool_vec)`, `from_bitmask(u64, width)`, `clmul(a, b)`, `ctz(v)`, `clear_lowest_bit(v)`
+**Bitmask:** `to_bitmask(bool_vec)`, `from_bitmask(u64, width)`, `mask8(bool_vec)` (true lanes become 0xFF), `nibblemask(u8[16])` (NEON's cheap movemask, 4 bits per lane), `clmul(a, b)`, `ctz(v)`, `clear_lowest_bit(v)`
 
 **Table lookup:** `tbl(table_u8x16, indices)`
 
-**Memory:** `gather(ptr, indices)`, `store(ptr, data)`, `store_at(ptr, offset, data)`, `compressstore(ptr, offset, data, mask)`, `load[Type](ptr)`, `loadu[Type](ptr)`
+**Memory:** `gather(ptr, indices)`, `store(ptr, data)`, `store_at(ptr, offset, data)`, `compressstore(ptr, offset, data, mask)`, `load[Type](ptr)`, `loadu[Type](ptr)`, `load_at[Type](ptr, offset)`, `ptr_add(ptr, offset)`, `ptr_addr(ptr)`. A byte pointer can load and store any type at any alignment.
 
 ## JSON parser
 
@@ -324,12 +348,16 @@ hotspot).
 Caveat in oxc's favor throughout: it produces full Unicode/escape/TS handling
 where ours is ASCII-focused.
 
+## JSON string escaping
+
+[`json-escape/`](json-escape/) reimplements the [`json-escape-simd`](https://crates.io/crates/json-escape-simd) crate. On Apple M2 Max it runs 2.4-3.4× faster on the crate's own file payloads, about 8.5 GB/s on 24 MB of real source code, with byte-identical output. Its README has the full results and how to reproduce them.
+
 ## How it works
 
 ```
-.simd source → lexer → parser → type checker → MLIR codegen → LLVM → .a + .rs
+.simd source → lexer → parser → type checker → MLIR codegen → mlir-translate → clang -O3 → .a + .rs
 ```
 
 Errors include source locations (`error at 3:5: undefined variable: foo`). The type checker catches width mismatches, bad builtin args, etc. before codegen.
 
-The codegen emits MLIR's vector dialect operations which LLVM lowers to NEON instructions. The `stream` construct becomes an `scf.for` loop with carried values.
+The codegen emits MLIR's vector dialect operations which LLVM lowers to NEON instructions. The `stream` construct becomes an `scf.for` loop with carried values, `while` an `scf.while`, and `if` an `scf.if`.
