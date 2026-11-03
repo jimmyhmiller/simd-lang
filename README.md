@@ -10,9 +10,12 @@ The whole thing is pretty rough around the edges. It was built iteratively as an
 
 ## Building & running
 
-The compiler needs LLVM/MLIR 21 (`brew install llvm@21`; `.cargo/config.toml` points
-the build at it). Compiling a `.simd` file also runs that install's `mlir-translate`
-and `clang`.
+The compiler needs LLVM/MLIR 21, and compiling a `.simd` file also runs that install's
+`mlir-translate`, `clang` and `llvm-ar`.
+
+- **macOS:** `brew install llvm@21`. `.cargo/config.toml` points the build at it.
+- **Linux:** install LLVM 21 with its MLIR libraries from apt.llvm.org, and override that
+  path: `export MLIR_SYS_210_PREFIX=/usr/lib/llvm-21 TABLEGEN_210_PREFIX=/usr/lib/llvm-21`.
 
 ```bash
 # Compile a .simd file to a static library + Rust bindings
@@ -23,7 +26,19 @@ cargo test --release
 
 # Emit MLIR (useful for debugging)
 cargo run --release -- compile examples/json_stage1.simd --emit-mlir
+
+# Cross-compile: any host can target either architecture
+cargo run --release -- compile examples/json_stage1.simd --target x86_64-unknown-linux-gnu -o output/
 ```
+
+## Targets
+
+| Target | Instructions | Register |
+|---|---|---|
+| `aarch64-*` | NEON | 16 bytes |
+| `x86_64-*` | AVX2 and PCLMUL (`-march=x86-64-v3 -mpclmul`) | 32 bytes |
+
+A program means the same thing on both, and the test suite passes on both. `--cpu` overrides the CPU that code is generated for, such as `--cpu znver5`. That can use newer instructions, but the language still treats a register as the size in the table.
 
 ## The language
 
@@ -50,7 +65,7 @@ fn add(a: f32[8], b: f32[8]) -> f32[8] {
 
 All element-wise: `+` `-` `*` `/` `&` `|` `^` `~` `>>` `<<` `>` `<` `>=` `<=` `==` `!=`
 
-`>>` and `<<` are bit shifts, by a literal, a scalar, or per lane. For sliding elements within a vector, use `lane_shr(v, n)` / `lane_shl(v, n)`.
+`>>` and `<<` are bit shifts, by a literal, a scalar, or per lane. `>>` is arithmetic on signed types and logical on unsigned ones. For sliding elements within a vector, use `lane_shr(v, n)` / `lane_shl(v, n)`.
 
 ### Literals & broadcasting
 
@@ -62,7 +77,11 @@ mask = chunk == '"'      -- char literal broadcasts
 inverted = data ^ ~0     -- ~0 broadcasts to all-ones
 ```
 
-For standalone literals (no binary context), add a type annotation:
+A literal takes its type wherever one is known: function arguments, `return`, reassigning a variable, values stored through a pointer, struct fields. Constant expressions like `0 - 1` or `1 << 4` count as literals. A literal that doesn't fit its type is an error, though either reading of the bits is fine, so `u8` accepts both `255` and `-1`.
+
+Hex and binary work too: `0xFF`, `0b101`. A constant is evaluated in the type it takes, so `~0 >> 4` is 15 as a `u8`. Ordering comparisons are stricter than bit operations, so `x > -1` on a `u8` is an error.
+
+Otherwise, add a type annotation:
 
 ```
 all_ones: u64[1] = ~0
@@ -76,12 +95,17 @@ table = [u8: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 zeros = [u8: 0; 64]     -- repeat syntax
 ```
 
+### Types
+
+Operands must have the same lane size and kind, or it's a compile error. Convert with `to_u8`, `to_i64` and friends, which extend by the source's signedness. Mixing signed and unsigned is an error where it would change the answer (ordering, `/`, `min`, `max`) and otherwise takes the left operand's type. Both branches of an `if` must agree exactly on a variable's type, and a variable can't change type in a `while`. An annotation reinterprets a value of the same size: `x: u8[1] = a` makes an `i8` read as unsigned.
+
 ### Masked expressions
 
 Per-lane select:
 
 ```
 result = [mask] value_if_true : value_if_false
+result = [mask] value_if_true          -- inactive lanes are zero
 ```
 
 ### Reductions & scans
@@ -91,9 +115,9 @@ total = +/ values                  -- sum reduction
 prefix_xor = scan.xor(bits, seed) -- inclusive prefix XOR with carry
 ```
 
-Reductions: `+/` `*/` `|/` `&/` `max/` `min/`
+Reductions: `+/` `*/` `|/` `&/` `max/` `min/`. They follow the lane type's signedness.
 
-Scans: `scan.add` `scan.xor` `scan.max` `scan.preceding_any`
+Scans: `scan.add` `scan.xor` `scan.max` `scan.preceding_any`. `scan.preceding_any` shifts by one lane, so each lane holds the previous lane's value.
 
 #### `scan_dfa` — prefix scan over a finite automaton
 
@@ -102,8 +126,7 @@ states = scan_dfa(table, classes, seed, num_states)
 ```
 
 A prefix scan whose combine operator is **DFA transition-function composition** —
-the general case of the `scan.*` family (`scan.xor` is a 2-state parity DFA;
-`scan.preceding_any` a 2-state latch). It returns the automaton's state after
+the general case of the `scan.*` family (`scan.xor` is a 2-state parity DFA). It returns the automaton's state after
 each lane.
 
 - `table: u8[256]` — `table[state*16 + class] = next_state` (≤16 states, ≤16 input classes)
@@ -147,6 +170,8 @@ return count
 
 `chunk_offset` is automatically available as the byte offset of the current chunk. Carry variables are available after the stream with their final values.
 
+`carry` updates come last in the body and apply together, using the values from before any of them. A carry with no update keeps its value. Assigning to an outer variable in the body is an error, because only carries leave a stream. A chunk's lane type must be the buffer's element type. The buffer's size must be a whole number of chunks, since a final partial chunk is read past the end of the buffer.
+
 ### If/else
 
 ```
@@ -157,9 +182,11 @@ if cond {
 }
 ```
 
-Only the taken branch runs, so stores inside it are conditional. Afterwards a variable holds its new value if either branch reassigned it; a name first defined inside the `if` is visible afterwards only if both branches define it. `return` must be a function's last statement.
+`else if` chains work too. Only the taken branch runs, so stores inside it are conditional. Afterwards a variable holds its new value if either branch reassigned it; a name first defined inside the `if` is visible afterwards only if both branches define it.
 
-`while cond { ... }` is a real loop, and `unlikely(cond)` marks a condition as usually false so its path is laid out away from the hot path.
+`while cond { ... }` is a real loop, `break` leaves the innermost one, and `return` works anywhere except inside a `stream`. `a && b` and `a || b` work on scalar bools and only evaluate `b` if needed; `&` and `|` work lane-wise and always evaluate both. `likely(cond)` and `unlikely(cond)` say which way a condition usually goes, so the other path is laid out away from the hot path.
+
+Escapes compile to flags, which LLVM's jump threading removes: `json_escape`'s hot path has no flag checks left. A function returning a pointer can only `return` as its last statement.
 
 ### Const tables
 
@@ -169,7 +196,23 @@ const TABLE = [u8: 10, 20, 30, 40]
 
 Read-only static data. Inside functions `TABLE` is a pointer.
 
+### Width generics
+
+```
+fn any_escape[N](a: u8[N], b: u8[N]) -> bool[1] { ... }
+fn copy[N](src: ptr[u8], dst: ptr[u8]) { ... }
+
+any_escape(x, y)      -- N inferred from the arguments
+copy[32](src, dst)    -- N given explicitly
+```
+
+Each set of widths gets its own copy, checked and compiled separately. Inside a body `N` is also a number: `load_at(p, N - 1)`. An `extern fn` can't be generic.
+
+`REGISTER_BYTES` is the width of a vector register on the target, usable as a width or a number, and `[_]` is however many lanes of a type fill one: `u8[_]` is `u8[16]` on NEON and `u8[32]` on AVX2, and `f32[_]` is `f32[4]` and `f32[8]`.
+
 ### Function kinds
+
+A public function that returns a `ptr` or a struct gets no Rust binding. Names starting with `__` are reserved, and code after a `return` or `break` is a compile error.
 
 ```
 private fn helper(...)          -- no exported symbol or binding; LLVM may rewrite its signature
@@ -188,6 +231,8 @@ struct Particle[N] {
 }
 ```
 
+Structs can be passed to and returned from functions, including generic ones, and assigned in `if` and `while`. `f(x).pos_x` reads a field of a returned struct, and `(a, b) = f(x)` binds its fields in order.
+
 ### Gather
 
 ```
@@ -197,13 +242,13 @@ chars = input.[positions]          -- equivalent
 
 ## Builtins
 
-**Vector:** `iota(N)`, `extract(vec, lane)`, `compress(data, mask)`, `popcount(mask)`, `to_u8(vec)`, `to_i32(vec)`, `to_i64(vec)`, `sqrt(vec)`, `split_lo(vec)`, `split_hi(vec)`, `concat(a, b)`, `min(a, b)`, `max(a, b)`
+**Vector:** `iota(N)`, `extract(vec, lane)`, `compress(data, mask)`, `popcount(mask)`, `to_u8(vec)`, `to_i32(vec)`, `to_i64(vec)`, `sqrt(vec)`, `split_lo(vec)`, `split_hi(vec)`, `concat(a, b)`, `shuffle(a, b, [T: lanes...])` (constant lanes, indexing `a` then `b`), `min(a, b)`, `max(a, b)`, `fold_min(u8[N])` (down to one register: the minimum of each lane across registers), `any(bool_vec)`, `any_in_first(bool_vec, n)` (over one register)
 
 **Lane shift:** `lane_shr(v, n)`, `lane_shl(v, n)`
 
-**Bitmask:** `to_bitmask(bool_vec)`, `from_bitmask(u64, width)`, `mask8(bool_vec)` (true lanes become 0xFF), `nibblemask(u8[16])` (NEON's cheap movemask, 4 bits per lane), `clmul(a, b)`, `ctz(v)`, `clear_lowest_bit(v)`
+**Bitmask:** `to_bitmask(bool_vec)`, `from_bitmask(u64, width)`, `mask8(bool_vec)` (true lanes become 0xFF), `nibblemask(u8[16])` (4 bits per lane, NEON's cheap movemask; lanes must be 0x00 or 0xFF), `clmul(a, b)`, `ctz(v)`, `clear_lowest_bit(v)`
 
-**Table lookup:** `tbl(table_u8x16, indices)`
+**Table lookup:** `tbl(table_u8x16, indices)`, where an index of 16 or more gives 0
 
 **Memory:** `gather(ptr, indices)`, `store(ptr, data)`, `store_at(ptr, offset, data)`, `compressstore(ptr, offset, data, mask)`, `load[Type](ptr)`, `loadu[Type](ptr)`, `load_at[Type](ptr, offset)`, `ptr_add(ptr, offset)`, `ptr_addr(ptr)`. A byte pointer can load and store any type at any alignment.
 
@@ -251,9 +296,9 @@ and number/keyword/identifier classification.
 
 ### Comparing against oxc
 
-`cargo run --release --features bench -- tokens <file.js>` dumps both token
+`cargo run --release --manifest-path oxc-bench/Cargo.toml -- tokens <file.js>` dumps both token
 streams (ours → `/tmp/ours.tokens`, [oxc](https://oxc.rs) → `/tmp/oxc.tokens`)
-and aligns them; `-- bench <file.js> N` measures throughput.
+and aligns them; `-- bench <file.js> N` (see `oxc-bench/`) measures throughput.
 
 **Getting oxc to lex standalone.** oxc's lexer is a co-routine of the parser:
 the parser resolves regex-vs-division and template `${}` nesting and feeds the
@@ -350,14 +395,25 @@ where ours is ASCII-focused.
 
 ## JSON string escaping
 
-[`json-escape/`](json-escape/) reimplements the [`json-escape-simd`](https://crates.io/crates/json-escape-simd) crate. On Apple M2 Max it runs 2.4-3.4× faster on the crate's own file payloads, about 8.5 GB/s on 24 MB of real source code, with byte-identical output. Its README has the full results and how to reproduce them.
+[`json-escape/`](json-escape/) reimplements the [`json-escape-simd`](https://crates.io/crates/json-escape-simd) crate. On the crate's own file payloads it runs 2.6-3.4× faster on an Apple M2 Max and 1.5-2.9× faster on Zen 5, with byte-identical output. Its README has the full results and how to reproduce them.
+
+## What's missing
+
+- **Variable lane shifts.** `lane_shr` and `lane_shl` take literal amounts.
+- **Seeded `scan.max`.** Only `scan.add` and `scan.xor` take a seed.
+- **Escaping a `stream`.** `return` and `break` can't leave one.
+- **Early return of a pointer.** A function returning a `ptr` can only `return` as its last statement.
+
+All of these are compile errors, not wrong results.
+
+Two things aren't checked. Function bodies are checked once per set of widths they're called with, so a generic function nothing calls isn't checked at all. `any_in_first(mask, n)` needs `n` from 1 to the lane count, which is checked only when `n` is a literal.
 
 ## How it works
 
 ```
-.simd source → lexer → parser → type checker → MLIR codegen → mlir-translate → clang -O3 → .a + .rs
+.simd source → lexer → parser → desugar → type checker → MLIR codegen → mlir-translate → clang -O3 → .a + .rs
 ```
 
 Errors include source locations (`error at 3:5: undefined variable: foo`). The type checker catches width mismatches, bad builtin args, etc. before codegen.
 
-The codegen emits MLIR's vector dialect operations which LLVM lowers to NEON instructions. The `stream` construct becomes an `scf.for` loop with carried values, `while` an `scf.while`, and `if` an `scf.if`.
+The codegen emits MLIR's vector dialect operations which LLVM lowers to NEON or AVX2 instructions. The `stream` construct becomes an `scf.for` loop with carried values, `while` an `scf.while`, and `if` an `scf.if`.

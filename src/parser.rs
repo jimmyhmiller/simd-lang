@@ -39,6 +39,14 @@ impl Parser {
         self.pos += 1;
     }
 
+    /// Whether the current token is the first on its line.
+    fn at_line_start(&self) -> bool {
+        match (self.pos.checked_sub(1).and_then(|p| self.tokens.get(p)), self.tokens.get(self.pos)) {
+            (Some(prev), Some(cur)) => cur.line > prev.line,
+            _ => false,
+        }
+    }
+
     fn current_span(&self) -> Span {
         self.tokens.get(self.pos).map(|s| Span::new(s.line, s.col)).unwrap_or(Span::dummy())
     }
@@ -293,7 +301,15 @@ impl Parser {
 
         if *self.peek() == Token::Return {
             self.pos += 1;
+            if *self.peek() == Token::RBrace {
+                return Stmt { kind: StmtKind::ReturnVoid, span };
+            }
             return Stmt { kind: StmtKind::Return(self.parse_expr()), span };
+        }
+
+        if *self.peek() == Token::Break {
+            self.pos += 1;
+            return Stmt { kind: StmtKind::Break, span };
         }
 
         // Stream: stream chunk: u8[64] over input carry (...) { ... }
@@ -461,6 +477,10 @@ impl Parser {
                 let value = self.parse_expr();
                 carry_updates.push((name, value));
             } else {
+                // Updates apply together at the end of an iteration, so they come last.
+                if !carry_updates.is_empty() {
+                    panic!("at {}: carry updates must come last in a stream body", self.current_span());
+                }
                 body.push(self.parse_stmt());
             }
         }
@@ -493,11 +513,16 @@ impl Parser {
         let mut else_body = Vec::new();
         if *self.peek() == Token::Else {
             self.pos += 1;
-            self.expect(&Token::LBrace);
-            while *self.peek() != Token::RBrace {
-                else_body.push(self.parse_stmt());
+            if *self.peek() == Token::If {
+                let nested_span = self.current_span();
+                else_body.push(self.parse_if(nested_span));
+            } else {
+                self.expect(&Token::LBrace);
+                while *self.peek() != Token::RBrace {
+                    else_body.push(self.parse_stmt());
+                }
+                self.expect(&Token::RBrace);
             }
-            self.expect(&Token::RBrace);
         }
 
         Stmt {
@@ -559,7 +584,7 @@ impl Parser {
                 fallback,
             }
         } else {
-            self.parse_or()
+            self.parse_logical_or()
         }
     }
 
@@ -621,6 +646,26 @@ impl Parser {
         }
         self.expect(&Token::RBracket);
         Expr::VecLit { elem_type, values }
+    }
+
+    fn parse_logical_or(&mut self) -> Expr {
+        let mut left = self.parse_logical_and();
+        while *self.peek() == Token::PipePipe {
+            self.pos += 1;
+            let right = self.parse_logical_and();
+            left = Expr::Logical { op: LogicalOp::Or, lhs: Box::new(left), rhs: Box::new(right) };
+        }
+        left
+    }
+
+    fn parse_logical_and(&mut self) -> Expr {
+        let mut left = self.parse_or();
+        while *self.peek() == Token::AmpAmp {
+            self.pos += 1;
+            let right = self.parse_or();
+            left = Expr::Logical { op: LogicalOp::And, lhs: Box::new(left), rhs: Box::new(right) };
+        }
+        left
     }
 
     fn parse_or(&mut self) -> Expr {
@@ -709,6 +754,8 @@ impl Parser {
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
+                // A `-` starting a line negates a new expression rather than subtracting.
+                Token::Minus if self.at_line_start() => break,
                 Token::Minus => BinOp::Sub,
                 _ => break,
             };
@@ -834,6 +881,8 @@ impl Parser {
                         mask,
                     };
                 }
+                // A `(` starting a line begins a new statement rather than calling.
+                Token::LParen if self.at_line_start() => break,
                 Token::LParen => {
                     self.pos += 1;
                     let args = self.parse_call_args();
@@ -923,6 +972,9 @@ impl Parser {
                     if let Some(lit) = self.try_parse_struct_lit() {
                         return lit;
                     }
+                    if let Some(callee) = self.try_parse_instantiation() {
+                        return callee;
+                    }
                 }
 
                 self.pos += 1;
@@ -989,6 +1041,34 @@ impl Parser {
         }
     }
 
+    /// `name[width, ...]` directly followed by a call's `(`.
+    fn try_parse_instantiation(&mut self) -> Option<Expr> {
+        let saved = self.pos;
+        let name = self.expect_ident();
+        self.pos += 1; // consume [
+        let mut widths = Vec::new();
+        loop {
+            match self.peek() {
+                Token::IntLit(_) | Token::Underscore | Token::Ident(_) | Token::LParen => {}
+                _ => {
+                    self.pos = saved;
+                    return None;
+                }
+            }
+            widths.push(self.parse_width());
+            if *self.peek() != Token::Comma {
+                break;
+            }
+            self.pos += 1;
+        }
+        if *self.peek() != Token::RBracket || *self.peek_at(1) != Token::LParen {
+            self.pos = saved;
+            return None;
+        }
+        self.pos += 1; // consume ]
+        Some(Expr::Instantiate { name, widths })
+    }
+
     fn try_parse_struct_lit(&mut self) -> Option<Expr> {
         let saved = self.pos;
 
@@ -1043,9 +1123,10 @@ impl Parser {
 pub fn parse(input: &str) -> Vec<Item> {
     let tokens = Lexer::new(input).tokenize();
     let mut parser = Parser::new(tokens);
-    parser.parse_program()
+    crate::desugar::desugar_items(parser.parse_program())
 }
 
+#[cfg(test)]
 pub fn parse_expr_str(input: &str) -> Expr {
     let tokens = Lexer::new(input).tokenize();
     let mut parser = Parser::new(tokens);
@@ -1696,7 +1777,7 @@ mod tests {
     // ============================================================
 
     fn parse_stmts(input: &str) -> Vec<Stmt> {
-        let wrapped = format!("fn __test__() {{ {} }}", input);
+        let wrapped = format!("fn wrapper() {{ {} }}", input);
         let items = parse(&wrapped);
         match &items[0] {
             Item::Fn(f) => f.body.clone(),

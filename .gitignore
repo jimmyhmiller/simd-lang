@@ -51,3 +51,5 @@ dist/
 json-escape/fixtures/
 json-escape/target/
 .worktrees/
+
+oxc-bench/target/

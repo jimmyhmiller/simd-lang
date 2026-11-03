@@ -37,13 +37,6 @@ pub enum TokKind {
     BlockComment,
 }
 
-impl TokKind {
-    #[inline]
-    fn is_comment(self) -> bool {
-        matches!(self, TokKind::LineComment | TokKind::BlockComment)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Token {
     pub kind: TokKind,
@@ -183,35 +176,6 @@ const CLASS: [u8; 256] = {
     t[b'`' as usize] = C_BACKTICK;
     t
 };
-
-/// After which previous significant token is a leading `/` a regex literal
-/// rather than a division operator? This is the lexer/parser feedback that
-/// makes JS impossible to lex context-free.
-fn regex_allowed(prev: Option<(TokKind, &str)>) -> bool {
-    match prev {
-        None => true,
-        // value-ending tokens → `/` is division. A complete template
-        // (`TemplateNoSub`) or a `TemplateTail` ends a value; `TemplateHead`/
-        // `TemplateMiddle` end with `${`, opening a fresh expression → regex ok.
-        Some((TokKind::Ident, _)) | Some((TokKind::Number, _))
-        | Some((TokKind::String, _)) | Some((TokKind::TemplateNoSub, _))
-        | Some((TokKind::TemplateTail, _)) | Some((TokKind::Regex, _)) => false,
-        Some((TokKind::Keyword, kw)) => {
-            // value-producing keywords are followed by division; the rest
-            // (return, typeof, delete, void, in, of, instanceof, new, ...)
-            // introduce an expression where `/` starts a regex.
-            !matches!(kw, "this" | "super" | "true" | "false" | "null")
-        }
-        Some((TokKind::Punct, p)) => {
-            // `)`, `]`, `}` close a value → division. Everything else → regex.
-            !matches!(p, ")" | "]" | "}")
-        }
-        // `${`-opening template parts, and comments (filtered out before we get
-        // here anyway) → regex allowed.
-        Some((TokKind::TemplateHead, _)) | Some((TokKind::TemplateMiddle, _))
-        | Some((TokKind::LineComment, _)) | Some((TokKind::BlockComment, _)) => true,
-    }
-}
 
 fn scan_string(src: &[u8], start: usize) -> usize {
     // Scalar loop: JS string literals are short, so memchr's SIMD setup cost

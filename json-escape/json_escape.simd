@@ -2,30 +2,43 @@
 --
 -- Writes `"`, the escaped contents of src[0..n], and `"` to dst, and returns the
 -- length written. dst needs room for 6n + 35 bytes: the final length is at most
--- 6n + 2, and stores overshoot the output position by up to 16 bytes past it.
+-- 6n + 2, and stores overshoot the output position by up to one register.
 -- Lanes read past the end of src stay inside the page holding src's last byte.
 --
 -- json_escape is an optimistic copy: it assumes no byte needs escaping, using only
 -- immediate constants and overlapping loads, so it has no remainder loops for
 -- varying lengths to mispredict. The first escape hands over to escape_rest, which
 -- has three speeds:
---   clean 64 bytes  a min-tree classifies four registers with one branch
+--   clean 64 bytes  lane-wise minimums classify all of it with one branch
 --   dirty block     branchless: every byte becomes 1 or 2 bytes through a `tbl`
 --                   shuffle, so 2-byte escapes cost the same at any density
 --   \u00XX block    scalar, since 6 output bytes per lane don't fit through `tbl`
 
-private fn needs_escape(v: u8[16]) -> u8[16] {
+private fn needs_escape[N](v: u8[N]) -> u8[N] {
     -- XOR 2 sends the 32 control bytes and '"' to exactly the bytes <= 32.
     return mask8((v ^ 2) <= 32) | mask8(v == '\\')
 }
 
--- Nonzero iff any byte of the four registers needs escaping. A byte does iff
--- x = v^2 has x <= 32 or y = v^92 has y == 0, so taking lane-wise minimums across
--- the registers first leaves one compare of each kind.
-private fn any_escape4(v0: u8[16], v1: u8[16], v2: u8[16], v3: u8[16]) -> u64[1] {
-    low = min(min(v0 ^ 2, v1 ^ 2), min(v2 ^ 2, v3 ^ 2))
-    zero = min(min(v0 ^ 92, v1 ^ 92), min(v2 ^ 92, v3 ^ 92))
-    return nibblemask(mask8(low <= 32) | mask8(zero == 0))
+-- Whether any byte of two N-byte registers needs escaping. A byte does iff x = v^2
+-- has x <= 32 or y = v^92 has y == 0, so folding each down to its lane-wise minimum
+-- leaves one compare of each kind, whatever the width.
+private fn any_escape[N](a: u8[N], b: u8[N]) -> bool[1] {
+    low = fold_min(min(a ^ 2, b ^ 2))
+    zero = fold_min(min(a ^ 92, b ^ 92))
+    return any((low <= 32) | (zero == 0))
+}
+
+-- Copy two N-byte registers from src[at] to dst[at + 1], unless a byte needs escaping.
+-- They may overlap: overlapping bytes copy identically.
+private fn copy2_if_clean[N](src: ptr[u8], dst: ptr[u8], a_at: i64[1], b_at: i64[1]) -> bool[1] {
+    a = load_at[u8[N]](src, a_at)
+    b = load_at[u8[N]](src, b_at)
+    if unlikely(any_escape(a, b)) {
+        return false
+    }
+    store_at(dst, a_at + 1, a)
+    store_at(dst, b_at + 1, b)
+    return true
 }
 
 -- Each byte's output and output length, from a table with an entry per byte value.
@@ -49,7 +62,7 @@ private fn escape_with_walk(v: u8[16], bits_in: u64[1], src: ptr[u8], i: i64[1],
     d = d_in
     pos: i64[1] = 0
     while bits != 0 {
-        lane = ctz(bits)
+        lane = to_i64(ctz(bits))
         store_at(dst, d, tbl(v, lanes + to_u8(pos)))
         d = d + lane - pos
         c = to_i64(load_at(src, i + lane))
@@ -66,13 +79,16 @@ private fn escape_with_walk(v: u8[16], bits_in: u64[1], src: ptr[u8], i: i64[1],
 private fn escape_with_shuffle(v: u8[16], mask: u8[16], letters: u8[16], dst: ptr[u8], d_in: i64[1]) -> i64[1] {
     -- Lanes to escape now hold the letter after the backslash; others are unchanged.
     merged = max(letters, v)
-    backslashes = [u8: 92, 92, 92, 92, 92, 92, 92, 92]
+    -- Each half gets its own table: its 8 lanes, then backslashes.
+    backslashes: u8[16] = 92
+    table_lo = shuffle(merged, backslashes, [u8: 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23])
+    table_hi = shuffle(merged, backslashes, [u8: 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31])
     bits = to_bitmask(mask > 127)
     lo = bits & 255
     hi = bits >> 8
 
-    out_lo = tbl(concat(split_lo(merged), backslashes), load_at[u8[16]](EXPAND, lo << 4))
-    out_hi = tbl(concat(split_hi(merged), backslashes), load_at[u8[16]](EXPAND, hi << 4))
+    out_lo = tbl(table_lo, load_at[u8[16]](EXPAND, lo << 4))
+    out_hi = tbl(table_hi, load_at[u8[16]](EXPAND, hi << 4))
 
     store_at(dst, d_in, out_lo)
     d = d_in + 8 + to_i64(load_at(POPCOUNT8, lo))
@@ -81,26 +97,21 @@ private fn escape_with_shuffle(v: u8[16], mask: u8[16], letters: u8[16], dst: pt
 }
 
 -- `count` lanes of v, starting at src[i]. Lanes at or past `count` are ignored.
-private fn escape_block(v: u8[16], src: ptr[u8], i: i64[1], count: i64[1], dst: ptr[u8], d_in: i64[1]) -> i64[1] {
+private fn escape_block(v: u8[16], src: ptr[u8], i: i64[1], count: i64[1], dst: ptr[u8], d: i64[1]) -> i64[1] {
     short_letters = [u8: 0, 0, 0, 0, 0, 0, 0, 0, 98, 116, 110, 0, 102, 114, 0, 0]
     letters = tbl(short_letters, v)
     live = load_at[u8[16]](LANE_MASK, 16 - count)
     mask = needs_escape(v) & live
-    no_short_form = mask8(max(letters, v) < 32) & live
-    if nibblemask(no_short_form) == 0 {
-        end = escape_with_shuffle(v, mask, letters, dst, d_in)
-        d = end - 16 + count
-    } else {
-        -- A control byte needs 6 output bytes. With up to 3 escapes in the block the
-        -- walk is cheaper; beyond that a per-byte table costs the same at any density.
-        bits = to_bitmask(mask > 127)
-        if clear_lowest_bit(clear_lowest_bit(clear_lowest_bit(bits))) == 0 {
-            d = escape_with_walk(v, bits, src, i, count, dst, d_in)
-        } else {
-            d = escape_with_table(src, i, count, dst, d_in)
-        }
+    if ~any((max(letters, v) < 32) & (live > 127)) {
+        return escape_with_shuffle(v, mask, letters, dst, d) - 16 + count
     }
-    return d
+    -- A control byte needs 6 output bytes. With up to 3 escapes in the block the
+    -- walk is cheaper; beyond that a per-byte table costs the same at any density.
+    bits = to_bitmask(mask > 127)
+    if clear_lowest_bit(clear_lowest_bit(clear_lowest_bit(bits))) == 0 {
+        return escape_with_walk(v, bits, src, i, count, dst, d)
+    }
+    return escape_with_table(src, i, count, dst, d)
 }
 
 -- The 16 lanes starting at src[i], of which only the first k < 16 are in bounds.
@@ -109,11 +120,15 @@ private fn load_tail(src: ptr[u8], i: i64[1], k: i64[1]) -> u8[16] {
         -- Past a page end, load the 16 bytes that end at src[i+k-1] instead (they
         -- are mapped: they start in the page holding src[i]) and slide them down.
         lanes = [u8: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        tail = tbl(load_at[u8[16]](src, i + k - 16), lanes + to_u8(16 - k))
-    } else {
-        tail = load_at[u8[16]](src, i)
+        return tbl(load_at[u8[16]](src, i + k - 16), lanes + to_u8(16 - k))
     }
-    return tail
+    return load_at[u8[16]](src, i)
+}
+
+-- Write the closing quote after n clean bytes, and return the string's length.
+private fn close(dst: ptr[u8], n: i64[1]) -> i64[1] {
+    store_at(dst, n + 1, 34)
+    return n + 2
 }
 
 -- Escape src[i..n], which is short, then close the string and return its length.
@@ -121,20 +136,15 @@ private fn load_tail(src: ptr[u8], i: i64[1], k: i64[1]) -> u8[16] {
 noinline private fn escape_end(src: ptr[u8], i_in: i64[1], n: i64[1], dst: ptr[u8], d_in: i64[1]) -> i64[1] {
     i = i_in
     d = d_in
-    sixteen: i64[1] = 16
-
     while i + 16 <= n {
-        d = escape_block(load_at[u8[16]](src, i), src, i, sixteen, dst, d)
+        d = escape_block(load_at[u8[16]](src, i), src, i, 16, dst, d)
         i = i + 16
     }
-
     k = n - i
     if k > 0 {
         d = escape_block(load_tail(src, i, k), src, i, k, dst, d)
     }
-
-    quote: u8[1] = 34
-    store_at(dst, d, quote)
+    store_at(dst, d, 34)
     return d + 1
 }
 
@@ -142,115 +152,64 @@ noinline private fn escape_end(src: ptr[u8], i_in: i64[1], n: i64[1], dst: ptr[u
 noinline private fn escape_rest(src: ptr[u8], i_in: i64[1], n: i64[1], dst: ptr[u8], d_in: i64[1]) -> i64[1] {
     i = i_in
     d = d_in
-    sixteen: i64[1] = 16
-
     while i + 64 <= n {
-        v0 = load_at[u8[16]](src, i)
-        v1 = load_at[u8[16]](src, i + 16)
-        v2 = load_at[u8[16]](src, i + 32)
-        v3 = load_at[u8[16]](src, i + 48)
-        if any_escape4(v0, v1, v2, v3) == 0 {
-            store_at(dst, d, v0)
-            store_at(dst, d + 16, v1)
-            store_at(dst, d + 32, v2)
-            store_at(dst, d + 48, v3)
-            d = d + 64
+        a = load_at[u8[32]](src, i)
+        b = load_at[u8[32]](src, i + 32)
+        if any_escape(a, b) {
+            d = escape_block(split_lo(a), src, i, 16, dst, d)
+            d = escape_block(split_hi(a), src, i + 16, 16, dst, d)
+            d = escape_block(split_lo(b), src, i + 32, 16, dst, d)
+            d = escape_block(split_hi(b), src, i + 48, 16, dst, d)
         } else {
-            d = escape_block(v0, src, i, sixteen, dst, d)
-            d = escape_block(v1, src, i + 16, sixteen, dst, d)
-            d = escape_block(v2, src, i + 32, sixteen, dst, d)
-            d = escape_block(v3, src, i + 48, sixteen, dst, d)
+            store_at(dst, d, a)
+            store_at(dst, d + 32, b)
+            d = d + 64
         }
         i = i + 64
     }
-
     return escape_end(src, i, n, dst, d)
 }
 
 extern fn json_escape(src: ptr[u8], n: i64[1], dst: ptr[u8]) -> i64[1] {
-    quote: u8[1] = 34
-    store_at(dst, 0, quote)
-    one: i64[1] = 1
-    zero: i64[1] = 0
+    store_at(dst, 0, 34)
 
-    if n < 16 {
+    -- Shorter than a register: one path for every length, with no length to mispredict.
+    if n < REGISTER_BYTES {
         if unlikely(n == 0) {
-            store_at(dst, 1, quote)
-            len = n + 2
-        } else {
-            tail = load_tail(src, zero, n)
-            -- Only the low 4n bits of the nibble mask are real.
-            if unlikely((nibblemask(needs_escape(tail)) << ((16 - n) << 2)) != 0) {
-                len = escape_end(src, zero, n, dst, one)
-            } else {
-                store_at(dst, 1, tail)
-                store_at(dst, n + 1, quote)
-                len = n + 2
-            }
+            return close(dst, 0)
         }
-    } else {
-    if n <= 32 {
-        -- Two registers that overlap by 32 - n bytes.
-        a = load_at[u8[16]](src, 0)
-        b = load_at[u8[16]](src, n - 16)
-        if unlikely(nibblemask(needs_escape(a) | needs_escape(b)) != 0) {
-            len = escape_end(src, zero, n, dst, one)
-        } else {
-            store_at(dst, 1, a)
-            store_at(dst, n - 15, b)
-            store_at(dst, n + 1, quote)
-            len = n + 2
+        -- The register read runs past the string, which must not leave its page.
+        if unlikely((ptr_addr(src) & 4095) > 4096 - REGISTER_BYTES) {
+            return escape_end(src, 0, n, dst, 1)
         }
-    } else {
-        -- The prefix copied so far needs no escapes, so d = i + 1 throughout.
-        i: i64[1] = 0
-        clean = i == 0
-        while clean & (i + 64 < n) {
-            v0 = load_at[u8[16]](src, i)
-            v1 = load_at[u8[16]](src, i + 16)
-            v2 = load_at[u8[16]](src, i + 32)
-            v3 = load_at[u8[16]](src, i + 48)
-            if any_escape4(v0, v1, v2, v3) == 0 {
-                store_at(dst, i + 1, v0)
-                store_at(dst, i + 17, v1)
-                store_at(dst, i + 33, v2)
-                store_at(dst, i + 49, v3)
-                i = i + 64
-            } else {
-                clean = i != i
-            }
+        tail = load_at[u8[REGISTER_BYTES]](src, 0)
+        if unlikely(any_in_first(needs_escape(tail) > 127, n)) {
+            return escape_end(src, 0, n, dst, 1)
         }
-        if clean {
-            -- 1 to 64 bytes remain. Cover them with registers ending at n-1, which
-            -- may overlap bytes already copied: those were clean and copy identically.
-            -- With n < 64 the two upper registers start at 0 and 16 instead.
-            lo: i64[1] = 0
-            if n >= 64 {
-                lo = n - 64
-                hi = lo + 16
-            } else {
-                hi = zero + 16
-            }
-            v0 = load_at[u8[16]](src, lo)
-            v1 = load_at[u8[16]](src, hi)
-            v2 = load_at[u8[16]](src, n - 32)
-            v3 = load_at[u8[16]](src, n - 16)
-            if any_escape4(v0, v1, v2, v3) == 0 {
-                store_at(dst, lo + 1, v0)
-                store_at(dst, hi + 1, v1)
-                store_at(dst, n - 31, v2)
-                store_at(dst, n - 15, v3)
-                store_at(dst, n + 1, quote)
-                len = n + 2
-            } else {
-                len = escape_rest(src, i, n, dst, i + 1)
-            }
-        } else {
-            len = escape_rest(src, i, n, dst, i + 1)
-        }
+        store_at(dst, 1, tail)
+        return close(dst, n)
     }
+
+    if n <= 2 * REGISTER_BYTES {
+        if copy2_if_clean[REGISTER_BYTES](src, dst, 0, n - REGISTER_BYTES) {
+            return close(dst, n)
+        }
+        return escape_end(src, 0, n, dst, 1)
     }
-    return len
+
+    -- While everything so far is clean, src[i] copies to dst[i + 1].
+    i: i64[1] = 0
+    while i + 4 * REGISTER_BYTES < n {
+        if ~copy2_if_clean[2 * REGISTER_BYTES](src, dst, i, i + 2 * REGISTER_BYTES) {
+            return escape_rest(src, i, n, dst, i + 1)
+        }
+        i = i + 4 * REGISTER_BYTES
+    }
+    -- The last stretch, or all of it when the string is shorter than one.
+    if copy2_if_clean[2 * REGISTER_BYTES](src, dst, max(n - 4 * REGISTER_BYTES, 0), n - 2 * REGISTER_BYTES) {
+        return close(dst, n)
+    }
+    return escape_rest(src, i, n, dst, i + 1)
 }
 
 -- === GENERATED TABLES: edit gen_tables.py, not below this line ===

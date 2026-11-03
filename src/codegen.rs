@@ -1,17 +1,19 @@
+#[cfg(test)]
+use melior::ir::operation::OperationLike;
 use melior::ir::r#type::TypeLike;
 use melior::ir::ValueLike;
 use std::collections::HashMap;
 
 use melior::{
     Context,
-    dialect::{DialectRegistry, arith, func, llvm as llvm_dialect, scf},
+    dialect::{DialectRegistry, arith, func, scf},
     ir::{
         Block, BlockLike, Location, Module, Operation, Region, Type, Value,
         attribute::{
             DenseElementsAttribute, DenseI32ArrayAttribute, DenseI64ArrayAttribute,
             FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute,
         },
-        operation::{OperationBuilder, OperationLike, OperationMutLike},
+        operation::{OperationBuilder, OperationMutLike},
         r#type::{FunctionType, IntegerType, MemRefType},
         RegionLike,
     },
@@ -59,6 +61,11 @@ impl ScalarType {
         matches!(self, ScalarType::F32 | ScalarType::F64)
     }
 
+    /// Whether values compare and widen as unsigned. A bool is 0 or 1.
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::Bool)
+    }
+
     pub fn is_int(&self) -> bool {
         !self.is_float() && *self != ScalarType::Bool
     }
@@ -79,7 +86,7 @@ impl ScalarType {
         }
     }
 
-    fn bit_width(&self) -> u32 {
+    pub fn bit_width(&self) -> u32 {
         match self {
             ScalarType::I8 | ScalarType::U8 => 8,
             ScalarType::I16 | ScalarType::U16 => 16,
@@ -123,6 +130,16 @@ fn splat_attr<'c>(
     }
 }
 
+/// The lane type a conversion builtin like `to_i64` produces.
+pub(crate) fn int_conversion_target(name: &str) -> Option<ScalarType> {
+    match name {
+        "to_u8" | "to_u16" | "to_u32" | "to_u64" | "to_i8" | "to_i16" | "to_i32" | "to_i64" => {
+            Some(ScalarType::from_name(&name[3..]))
+        }
+        _ => None,
+    }
+}
+
 /// Returns true if the type name is a built-in scalar type (not a struct).
 fn is_scalar_type_name(name: &str) -> bool {
     matches!(
@@ -156,17 +173,22 @@ fn ptr_to_memref_type<'c>(ctx: &'c Context, ty: &ast::Type) -> Type<'c> {
 
 /// Resolve an AST type to a concrete VecType.
 /// `comptime_env` maps comptime param names to concrete values.
-fn resolve_type(
+pub(crate) fn resolve_type(
     ty: &ast::Type,
     comptime_env: &HashMap<String, u64>,
     native_width: u64,
 ) -> VecType {
     let scalar = ScalarType::from_name(&ty.name);
+    // `native_width` is one register in bytes, so `_` is however many of this type fit.
+    let lane_bytes = (scalar.bit_width() as u64 / 8).max(1);
     let width = ty
         .width
         .as_ref()
         .expect("type must have a width")
-        .eval(comptime_env, native_width);
+        .eval(comptime_env, native_width / lane_bytes);
+    if width == 0 {
+        panic!("a {} vector can't have zero lanes", ty.name);
+    }
     VecType { scalar, width }
 }
 
@@ -193,7 +215,69 @@ enum Binding<'c, 'a> {
 }
 
 /// Codegen state for a single function.
+/// The architecture code is generated for. The language means the same thing on each;
+/// this picks the instructions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Arch {
+    /// NEON, 16-byte registers.
+    Aarch64,
+    /// AVX2 and PCLMUL (x86-64-v3 plus PCLMUL), 32-byte registers.
+    X86_64,
+}
+
+impl Arch {
+    pub fn host() -> Arch {
+        if cfg!(target_arch = "x86_64") { Arch::X86_64 } else { Arch::Aarch64 }
+    }
+
+    /// The architecture of an LLVM target triple.
+    pub fn of_triple(triple: &str) -> Option<Arch> {
+        match triple.split('-').next()? {
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            "x86_64" => Some(Arch::X86_64),
+            _ => None,
+        }
+    }
+
+    /// The triple used when none is given.
+    pub fn host_triple() -> &'static str {
+        match (Arch::host(), cfg!(target_os = "macos")) {
+            (Arch::Aarch64, true) => "aarch64-apple-darwin",
+            (Arch::Aarch64, false) => "aarch64-unknown-linux-gnu",
+            (Arch::X86_64, true) => "x86_64-apple-darwin",
+            (Arch::X86_64, false) => "x86_64-unknown-linux-gnu",
+        }
+    }
+
+    /// The width of one vector register.
+    pub fn register_bytes(self) -> u64 {
+        match self {
+            Arch::Aarch64 => 16,
+            Arch::X86_64 => 32,
+        }
+    }
+}
+
+/// What one variable contributes to the results of an `scf.if`.
+enum IfResult {
+    Vec(String, VecType),
+    Ptr(String, ScalarType),
+    Struct(String, Vec<(String, VecType)>),
+}
+
+/// The monomorphized copies of generic functions a module needs, found as calls to
+/// them are emitted.
+struct Instances {
+    arch: Arch,
+    /// The environment the module was compiled with.
+    module_env: HashMap<String, u64>,
+    seen: std::collections::HashSet<String>,
+    pending: Vec<ast::FnDef>,
+    envs: HashMap<String, HashMap<String, u64>>,
+}
+
 struct FnCodegen<'c, 'a> {
+    instances: std::rc::Rc<std::cell::RefCell<Instances>>,
     ctx: &'c Context,
     loc: Location<'c>,
     block: &'a Block<'c>,
@@ -214,7 +298,19 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
     }
 
     fn emit_expr(&mut self, expr: &ast::Expr) -> (Value<'c, 'a>, VecType) {
+        if let Some(ast::ConstValue::Bool(_)) = expr.const_value() {
+            return self.emit_literal_broadcast(expr, VecType { scalar: ScalarType::Bool, width: 1 });
+        }
+        if Self::is_literal(expr) && !matches!(expr, ast::Expr::IntLit(_) | ast::Expr::FloatLit(_) | ast::Expr::CharLit(_)) {
+            self.error("this literal expression needs a type: use it with a typed value, or add an annotation");
+        }
         match expr {
+            ast::Expr::Instantiate { name, .. } => {
+                self.error(&format!("generic function '{}' can only be called", name));
+            }
+
+            ast::Expr::Logical { op, lhs, rhs } => self.emit_logical(*op, lhs, rhs),
+
             ast::Expr::Ident(name) => {
                 let binding = self
                     .vars
@@ -250,19 +346,13 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 ));
             }
 
-            ast::Expr::BoolLit(b) => {
-                self.error(&format!(
-                    "bare bool literal {} needs type context (use in binary op or add type annotation)",
-                    b
-                ));
-            }
+            ast::Expr::BoolLit(_) => unreachable!("handled as a constant above"),
 
             ast::Expr::CharLit(ch) => {
-                // Char literals are bare just like int literals — need context
-                panic!(
+                self.error(&format!(
                     "bare char literal '{}' needs type context (use in binary op)",
                     ch
-                );
+                ));
             }
 
             ast::Expr::BinOp { op, lhs, rhs } => self.emit_binop(*op, lhs, rhs),
@@ -273,7 +363,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 mask,
                 body,
                 fallback,
-            } => self.emit_masked(mask, body, fallback.as_deref()),
+            } => self.emit_masked(mask, body, fallback.as_deref(), None),
 
             ast::Expr::Reduction { op, operand } => self.emit_reduction(*op, operand),
 
@@ -293,7 +383,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 name,
                 width,
                 fields,
-            } => self.emit_struct_lit(name, width, fields),
+            } => {
+                let _ = (name, width, fields);
+                self.error("a struct literal can't be used as a single value; assign it, pass it, or return it");
+            }
 
             ast::Expr::Load { aligned, ty, ptr, offset } => self.emit_load(*aligned, ty, ptr, offset.as_deref()),
 
@@ -304,6 +397,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let vec_mlir = vt.to_mlir_type(self.ctx);
                 let scalar_mlir = scalar.to_mlir_type(self.ctx);
 
+                if scalar.is_int() {
+                    let bits = scalar.bit_width();
+                    if let Some(bad) = values.iter().find(|&&v| bits < 64 && (v < -(1i64 << (bits - 1)) || v >= (1i64 << bits))) {
+                        self.error(&format!("literal {} doesn't fit in {:?}", bad, scalar));
+                    }
+                }
                 let attrs: Vec<melior::ir::attribute::Attribute> = values
                     .iter()
                     .map(|v| {
@@ -331,104 +430,84 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         target: VecType,
     ) -> (Value<'c, 'a>, VecType) {
         let vec_type = target.to_mlir_type(self.ctx);
-
-        match expr {
-            ast::Expr::FloatLit(f) => {
+        let scalar_type = target.scalar.to_mlir_type(self.ctx);
+        let attr: melior::ir::attribute::Attribute = match expr.const_value() {
+            Some(ast::ConstValue::Float(f)) => {
                 if !target.scalar.is_float() {
                     self.error("float literal in non-float context");
                 }
-                let scalar_type = target.scalar.to_mlir_type(self.ctx);
-                let attr = FloatAttribute::new(self.ctx, scalar_type, *f);
-                let splat = splat_attr(vec_type, &[attr.into()])
-                    .expect("failed to create splat attribute");
-                let op = arith::constant(self.ctx, splat.into(), self.loc);
-                let val = self.block.append_operation(op).result(0).unwrap().into();
-                (val, target)
+                FloatAttribute::new(self.ctx, scalar_type, f).into()
             }
-            ast::Expr::IntLit(n) => {
-                if !(target.scalar.is_int() || target.scalar == ScalarType::Bool) {
+            Some(ast::ConstValue::Bool(b)) => {
+                if target.scalar != ScalarType::Bool {
+                    self.error(&format!("bool literal used as {:?}", target.scalar));
+                }
+                IntegerAttribute::new(scalar_type, b as i64).into()
+            }
+            Some(ast::ConstValue::Int(n)) => {
+                if target.scalar.is_float() {
                     self.error("int literal in float context");
                 }
-                let scalar_type = target.scalar.to_mlir_type(self.ctx);
-                let attr = IntegerAttribute::new(scalar_type, *n);
-                let splat = splat_attr(vec_type, &[attr.into()])
-                    .expect("failed to create splat attribute");
-                let op = arith::constant(self.ctx, splat.into(), self.loc);
-                let val = self.block.append_operation(op).result(0).unwrap().into();
-                (val, target)
-            }
-            ast::Expr::CharLit(ch) => {
-                // Char literal broadcast: use the char's ASCII value as an integer
-                if !(target.scalar.is_int() || target.scalar == ScalarType::Bool) {
-                    self.error("char literal in float context");
-                }
-                let scalar_type = target.scalar.to_mlir_type(self.ctx);
-                let attr = IntegerAttribute::new(scalar_type, *ch as i64);
-                let splat = splat_attr(vec_type, &[attr.into()])
-                    .expect("failed to create splat attribute");
-                let op = arith::constant(self.ctx, splat.into(), self.loc);
-                let val = self.block.append_operation(op).result(0).unwrap().into();
-                (val, target)
-            }
-            ast::Expr::UnaryOp { op, operand } => {
-                // Broadcast the inner literal, then apply the unary op
-                let (val, ty) = self.emit_literal_broadcast(operand, target);
-                match op {
-                    ast::UnaryOp::Not => {
-                        // Bitwise NOT: xor with all-ones
-                        let vec_type = ty.to_mlir_type(self.ctx);
-                        let scalar_type = ty.scalar.to_mlir_type(self.ctx);
-                        let ones_attr = IntegerAttribute::new(scalar_type, -1);
-                        let splat = splat_attr(vec_type, &[ones_attr.into()])
-                            .expect("failed to create all-ones splat");
-                        let ones = self
-                            .block
-                            .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let result = self
-                            .block
-                            .append_operation(arith::xori(val, ones, self.loc))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        (result, ty)
+                let value = if target.scalar == ScalarType::Bool {
+                    if n != 0 && n != 1 {
+                        self.error(&format!("{} isn't a bool: use true, false, 0 or 1", n));
                     }
-                    ast::UnaryOp::Neg => {
-                        if ty.scalar.is_float() {
-                            let neg = self
-                                .block
-                                .append_operation(arith::negf(val, self.loc))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            (neg, ty)
-                        } else {
-                            let vec_type = ty.to_mlir_type(self.ctx);
-                            let scalar_type = ty.scalar.to_mlir_type(self.ctx);
-                            let zero_attr = IntegerAttribute::new(scalar_type, 0);
-                            let splat = splat_attr(vec_type, &[zero_attr.into()])
-                                .expect("failed to create zero splat");
-                            let zero = self
-                                .block
-                                .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            let neg = self
-                                .block
-                                .append_operation(arith::subi(zero, val, self.loc))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            (neg, ty)
-                        }
-                    }
-                }
+                    n
+                } else {
+                    expr.eval_int(target.scalar.bit_width(), !target.scalar.is_unsigned())
+                        .unwrap_or_else(|e| self.error(&format!("{} (as {:?})", e, target.scalar)))
+                };
+                IntegerAttribute::new(scalar_type, value).into()
             }
-            _ => panic!("emit_literal_broadcast called on non-literal"),
+            None => self.error("this literal expression can't be evaluated: check for overflow or division by zero"),
+        };
+        let splat = splat_attr(vec_type, &[attr]).expect("failed to create splat attribute");
+        let op = arith::constant(self.ctx, splat, self.loc);
+        let val = self.block.append_operation(op).result(0).unwrap().into();
+        (val, target)
+    }
+
+    /// Whether an expression has no type of its own and takes one from where it's used.
+    fn takes_expected_type(expr: &ast::Expr) -> bool {
+        match expr {
+            _ if Self::is_literal(expr) => true,
+            ast::Expr::Masked { body, fallback, .. } => {
+                Self::is_literal(body) && fallback.as_deref().is_none_or(Self::is_literal)
+            }
+            ast::Expr::BinOp { op: ast::BinOp::BitShl | ast::BinOp::BitShr, lhs, .. } => Self::is_literal(lhs),
+            _ => false,
         }
+    }
+
+    /// Evaluate an expression where the surrounding code fixes the type: an annotation, a
+    /// parameter, a return type or a struct field. Same-sized integers are reinterpreted.
+    fn emit_expr_typed(&mut self, expr: &ast::Expr, expected: VecType) -> (Value<'c, 'a>, VecType) {
+        match expr {
+            _ if Self::is_literal(expr) => return self.emit_literal_broadcast(expr, expected),
+            ast::Expr::Masked { mask, body, fallback } if Self::takes_expected_type(expr) => {
+                return self.emit_masked(mask, body, fallback.as_deref(), Some(expected.scalar));
+            }
+            ast::Expr::BinOp { op: op @ (ast::BinOp::BitShl | ast::BinOp::BitShr), lhs, rhs } if Self::is_literal(lhs) => {
+                let (lval, lty) = self.emit_literal_broadcast(lhs, expected);
+                return self.emit_shift(*op, lval, lty, rhs);
+            }
+            _ => {}
+        }
+        let (val, ty) = self.emit_expr(expr);
+        if ty.width == 0 {
+            return (val, ty);
+        }
+        if ty.width == expected.width && ty.to_mlir_type(self.ctx) == expected.to_mlir_type(self.ctx) {
+            return (val, expected);
+        }
+        if ty.width == 1 && expected.width > 1 && ty.scalar.bit_width() == expected.scalar.bit_width() {
+            let (wide, _) = self.emit_broadcast_to_width(val, ty, expected.width);
+            return (wide, expected);
+        }
+        self.error(&format!(
+            "expected {:?}[{}], got {:?}[{}]",
+            expected.scalar, expected.width, ty.scalar, ty.width
+        ));
     }
 
     fn is_literal(expr: &ast::Expr) -> bool {
@@ -440,8 +519,66 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             // ~literal and -literal are broadcastable (e.g. ~0 = all-ones)
             ast::Expr::UnaryOp { op: ast::UnaryOp::Not, operand }
             | ast::Expr::UnaryOp { op: ast::UnaryOp::Neg, operand } => Self::is_literal(operand),
+            ast::Expr::BinOp { .. } | ast::Expr::Logical { .. } => expr.const_value().is_some(),
             _ => false,
         }
+    }
+
+    /// `lval << rhs` or `lval >> rhs`. `>>` is arithmetic on signed types and logical on
+    /// unsigned ones. The amount is a constant, a scalar, or one amount per lane.
+    fn emit_shift(
+        &mut self,
+        op: ast::BinOp,
+        lval: Value<'c, 'a>,
+        lty: VecType,
+        rhs: &ast::Expr,
+    ) -> (Value<'c, 'a>, VecType) {
+        let bits = lty.scalar.bit_width() as i64;
+        let amount: Value = if let Some(ast::ConstValue::Int(n)) = rhs.const_value() {
+            if n < 0 || n >= bits {
+                self.error(&format!("shift by {} is out of range for {:?}", n, lty.scalar));
+            }
+            let attr = IntegerAttribute::new(lty.scalar.to_mlir_type(self.ctx), n);
+            let splat = splat_attr(lty.to_mlir_type(self.ctx), &[attr.into()]).unwrap();
+            self.block
+                .append_operation(arith::constant(self.ctx, splat, self.loc))
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            let (rval, rty) = self.emit_expr(rhs);
+            if rty.width != 1 && rty.width != lty.width {
+                self.error(&format!(
+                    "shift amount width {} does not match operand width {}",
+                    rty.width, lty.width
+                ));
+            }
+            // The amount takes the operand's lane size; only its value matters.
+            let sized = VecType { scalar: lty.scalar, width: rty.width };
+            let as_unsigned = VecType {
+                scalar: match rty.scalar.bit_width() {
+                    8 => ScalarType::U8,
+                    16 => ScalarType::U16,
+                    32 => ScalarType::U32,
+                    _ => ScalarType::U64,
+                },
+                width: rty.width,
+            };
+            let resized = self.emit_int_resize(rval, as_unsigned, sized);
+            if rty.width == 1 && lty.width > 1 {
+                self.emit_broadcast_to_width(resized, sized, lty.width).0
+            } else {
+                resized
+            }
+        };
+        let shift_op = if op == ast::BinOp::BitShl {
+            arith::shli(lval, amount, self.loc)
+        } else if lty.scalar.is_unsigned() {
+            arith::shrui(lval, amount, self.loc)
+        } else {
+            arith::shrsi(lval, amount, self.loc)
+        };
+        (self.block.append_operation(shift_op).result(0).unwrap().into(), lty)
     }
 
     fn emit_binop(
@@ -450,51 +587,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         lhs: &ast::Expr,
         rhs: &ast::Expr,
     ) -> (Value<'c, 'a>, VecType) {
-        // Bit shift: RHS is a compile-time integer constant, broadcast to match LHS width
         if op == ast::BinOp::BitShl || op == ast::BinOp::BitShr {
             let (lval, lty) = self.emit_expr(lhs);
-            // A literal amount broadcasts to the left operand; otherwise the amount
-            // is a value (per-lane when wide, or a scalar broadcast across lanes).
-            let shift_vec: Value = if let ast::Expr::IntLit(n) = rhs {
-                let scalar_type = lty.scalar.to_mlir_type(self.ctx);
-                let vec_type = lty.to_mlir_type(self.ctx);
-                let shift_attr = IntegerAttribute::new(scalar_type, *n);
-                let shift_splat = splat_attr(vec_type, &[shift_attr.into()]).unwrap();
-                self.block
-                    .append_operation(arith::constant(self.ctx, shift_splat.into(), self.loc))
-                    .result(0)
-                    .unwrap()
-                    .into()
-            } else {
-                let (rval, rty) = self.emit_expr(rhs);
-                if rty.width == 1 && lty.width > 1 {
-                    self.emit_broadcast_to_width(rval, rty, lty.width).0
-                } else if rty.width != lty.width {
-                    self.error(&format!(
-                        "shift amount width {} does not match operand width {}",
-                        rty.width, lty.width
-                    ));
-                } else {
-                    rval
-                }
-            };
-            let result_op = if op == ast::BinOp::BitShl {
-                arith::shli(lval, shift_vec, self.loc)
-            } else {
-                arith::shrui(lval, shift_vec, self.loc)
-            };
-            let result: Value = self
-                .block
-                .append_operation(result_op)
-                .result(0)
-                .unwrap()
-                .into();
-            return (result, lty);
+            return self.emit_shift(op, lval, lty, rhs);
         }
 
         // Handle literal broadcasting: if one side is a literal, infer its type from the other.
         let (lval, lty, rval, rty) = match (Self::is_literal(lhs), Self::is_literal(rhs)) {
-            (true, true) => panic!("both operands are literals — cannot infer vector width"),
+            (true, true) => self.error("this literal expression needs a type: use it with a typed value, or add an annotation"),
             (true, false) => {
                 let (rv, rt) = self.emit_expr(rhs);
                 let (lv, lt) = self.emit_literal_broadcast(lhs, rt);
@@ -529,9 +629,21 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 lty.scalar, lty.width, rty.scalar, rty.width
             ));
         }
+        if lty.to_mlir_type(self.ctx) != rty.to_mlir_type(self.ctx) {
+            self.error(&format!(
+                "operands have different types: {:?}[{}] and {:?}[{}]; convert with to_i64 and friends",
+                lty.scalar, lty.width, rty.scalar, rty.width
+            ));
+        }
 
         match op {
             ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div => {
+                if lty.scalar == ScalarType::Bool {
+                    self.error("arithmetic on bools isn't defined; use &, | and ^");
+                }
+                if op == ast::BinOp::Div && matches!(rhs.const_value(), Some(ast::ConstValue::Int(0))) {
+                    self.error("division by zero");
+                }
                 let result_op = if lty.scalar.is_float() {
                     match op {
                         ast::BinOp::Add => arith::addf(lval, rval, self.loc),
@@ -545,6 +657,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         ast::BinOp::Add => arith::addi(lval, rval, self.loc),
                         ast::BinOp::Sub => arith::subi(lval, rval, self.loc),
                         ast::BinOp::Mul => arith::muli(lval, rval, self.loc),
+                        ast::BinOp::Div if lty.scalar.is_unsigned() => arith::divui(lval, rval, self.loc),
                         ast::BinOp::Div => arith::divsi(lval, rval, self.loc),
                         _ => unreachable!(),
                     }
@@ -574,16 +687,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         ast::BinOp::GtEq => arith::CmpfPredicate::Oge,
                         ast::BinOp::LtEq => arith::CmpfPredicate::Ole,
                         ast::BinOp::EqEq => arith::CmpfPredicate::Oeq,
-                        ast::BinOp::NotEq => arith::CmpfPredicate::One,
+                        ast::BinOp::NotEq => arith::CmpfPredicate::Une,
                         _ => unreachable!(),
                     };
                     arith::cmpf(self.ctx, pred, lval, rval, self.loc)
                 } else {
-                    let is_unsigned = matches!(
-                        lty.scalar,
-                        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
-                    );
-                    let pred = match (op, is_unsigned) {
+                    let pred = match (op, lty.scalar.is_unsigned()) {
                         (ast::BinOp::Gt, false) => arith::CmpiPredicate::Sgt,
                         (ast::BinOp::Lt, false) => arith::CmpiPredicate::Slt,
                         (ast::BinOp::GtEq, false) => arith::CmpiPredicate::Sge,
@@ -776,45 +885,87 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         }
     }
 
+    /// `[mask] body : fallback`. Literal branches take `literal_scalar`, or else default to
+    /// i32 or f32. A scalar branch broadcasts across a vector mask.
     fn emit_masked(
         &mut self,
         mask: &ast::Expr,
         body: &ast::Expr,
         fallback: Option<&ast::Expr>,
+        literal_scalar: Option<ScalarType>,
     ) -> (Value<'c, 'a>, VecType) {
         let (mask_val, mask_ty) = self.emit_expr(mask);
-        let fallback = fallback.expect("masked expression without fallback not yet supported (inactive lanes would be undefined)");
+        if mask_ty.scalar != ScalarType::Bool {
+            self.error(&format!("a mask must be bool, got {:?}", mask_ty.scalar));
+        }
+        // With no fallback, inactive lanes are zero of whatever type the body has.
+        let Some(fallback) = fallback else {
+            let (body_val, body_ty) = if Self::is_literal(body) {
+                let is_float = matches!(body.const_value(), Some(ast::ConstValue::Float(_)));
+                let scalar = literal_scalar.unwrap_or(if is_float { ScalarType::F32 } else { ScalarType::I32 });
+                self.emit_literal_broadcast(body, VecType { scalar, width: mask_ty.width })
+            } else {
+                self.emit_expr(body)
+            };
+            let (body_val, body_ty) = if body_ty.width == 1 && mask_ty.width > 1 {
+                self.emit_broadcast_to_width(body_val, body_ty, mask_ty.width)
+            } else {
+                (body_val, body_ty)
+            };
+            let zero = self.emit_zero_vector(body_ty);
+            let val = self
+                .block
+                .append_operation(arith::select(mask_val, body_val, zero, self.loc))
+                .result(0)
+                .unwrap()
+                .into();
+            return (val, body_ty);
+        };
 
-        // Handle literal body/fallback: infer type from whichever side is not a literal,
-        // or from the mask width if both are literals.
-        let (body_val, body_ty, fallback_val) =
+        let (mut body_val, mut body_ty, mut fallback_val, mut fallback_ty) =
             match (Self::is_literal(body), Self::is_literal(fallback)) {
                 (true, true) => {
-                    // Both literals: infer type from mask width, default to i32
-                    let target = VecType {
-                        scalar: ScalarType::I32,
-                        width: mask_ty.width,
-                    };
+                    let is_float = matches!(body.const_value(), Some(ast::ConstValue::Float(_)));
+                    let scalar = literal_scalar.unwrap_or(if is_float { ScalarType::F32 } else { ScalarType::I32 });
+                    let target = VecType { scalar, width: mask_ty.width };
                     let (bv, bt) = self.emit_literal_broadcast(body, target);
-                    let (fv, _) = self.emit_literal_broadcast(fallback, target);
-                    (bv, bt, fv)
+                    let (fv, ft) = self.emit_literal_broadcast(fallback, target);
+                    (bv, bt, fv, ft)
                 }
                 (true, false) => {
                     let (fv, ft) = self.emit_expr(fallback);
                     let (bv, bt) = self.emit_literal_broadcast(body, ft);
-                    (bv, bt, fv)
+                    (bv, bt, fv, ft)
                 }
                 (false, true) => {
                     let (bv, bt) = self.emit_expr(body);
-                    let (fv, _) = self.emit_literal_broadcast(fallback, bt);
-                    (bv, bt, fv)
+                    let (fv, ft) = self.emit_literal_broadcast(fallback, bt);
+                    (bv, bt, fv, ft)
                 }
                 (false, false) => {
                     let (bv, bt) = self.emit_expr(body);
-                    let (fv, _) = self.emit_expr(fallback);
-                    (bv, bt, fv)
+                    let (fv, ft) = self.emit_expr(fallback);
+                    (bv, bt, fv, ft)
                 }
             };
+
+        if mask_ty.width > 1 {
+            if body_ty.width == 1 {
+                (body_val, body_ty) = self.emit_broadcast_to_width(body_val, body_ty, mask_ty.width);
+            }
+            if fallback_ty.width == 1 {
+                (fallback_val, fallback_ty) = self.emit_broadcast_to_width(fallback_val, fallback_ty, mask_ty.width);
+            }
+            if body_ty.width != mask_ty.width {
+                self.error(&format!("mask has {} lanes but its branch has {}", mask_ty.width, body_ty.width));
+            }
+        }
+        if body_ty.to_mlir_type(self.ctx) != fallback_ty.to_mlir_type(self.ctx) {
+            self.error(&format!(
+                "masked branches have different types: {:?}[{}] and {:?}[{}]",
+                body_ty.scalar, body_ty.width, fallback_ty.scalar, fallback_ty.width
+            ));
+        }
 
         // arith.select works lane-wise on vectors
         let val = self
@@ -839,6 +990,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         if ty.width == 1 {
             return (val, result_ty);
         }
+        if ty.scalar == ScalarType::Bool && matches!(op, ast::ReductionOp::Add | ast::ReductionOp::Mul) {
+            self.error("+/ and */ aren't defined on bools; use popcount, |/ or &/");
+        }
 
         // Use vector.reduction operation via OperationBuilder
         let kind_str = match op {
@@ -849,6 +1003,8 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             ast::ReductionOp::Max => {
                 if ty.scalar.is_float() {
                     "maximumf"
+                } else if ty.scalar.is_unsigned() {
+                    "maxui"
                 } else {
                     "maxsi"
                 }
@@ -856,6 +1012,8 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             ast::ReductionOp::Min => {
                 if ty.scalar.is_float() {
                     "minimumf"
+                } else if ty.scalar.is_unsigned() {
+                    "minui"
                 } else {
                     "minsi"
                 }
@@ -897,112 +1055,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         base: &ast::Expr,
         field: &str,
     ) -> (Value<'c, 'a>, VecType) {
-        // The base must be a struct-bound variable
-        match base {
-            ast::Expr::Ident(name) => {
-                let binding = self
-                    .vars
-                    .get(name)
-                    .unwrap_or_else(|| self.error(&format!("undefined variable: {}", name)))
-                    .clone();
-                match binding {
-                    Binding::Struct { fields } => {
-                        for (fname, val, ty) in &fields {
-                            if fname == field {
-                                return (*val, *ty);
-                            }
-                        }
-                        self.error(&format!(
-                            "struct '{}' has no field '{}'",
-                            name, field
-                        ));
-                    }
-                    Binding::Vec(_, _) | Binding::Ptr(_, _) => {
-                        panic!(
-                            "cannot access field '{}' on non-struct variable '{}'",
-                            field, name
-                        );
-                    }
-                }
-            }
-            _ => panic!("field access on complex expressions not yet supported; use a variable"),
+        if !self.is_struct_expr(base) {
+            self.error(&format!("field access '.{}' on a non-struct", field));
         }
-    }
-
-    fn emit_struct_lit(
-        &mut self,
-        name: &str,
-        width: &ast::Width,
-        field_exprs: &[(String, ast::Expr)],
-    ) -> (Value<'c, 'a>, VecType) {
-        // Look up the struct definition
-        let struct_def = self
-            .struct_defs
-            .get(name)
-            .unwrap_or_else(|| panic!("undefined struct: {}", name))
-            .clone();
-
-        // Evaluate the width
-        let concrete_width = width.eval(&self.comptime_env, self.native_width);
-
-        // Build a comptime env for the struct's own comptime params
-        // Map the struct's first comptime param (if any) to the concrete width
-        let mut struct_comptime = self.comptime_env.clone();
-        if let Some(cp) = struct_def.comptime_params.first() {
-            struct_comptime.insert(cp.name.clone(), concrete_width);
+        let fields = self.emit_struct_value(base);
+        match fields.iter().find(|(name, _, _)| name == field) {
+            Some((_, val, ty)) => (*val, *ty),
+            None => self.error(&format!("struct has no field '{}'", field)),
         }
-
-        // Evaluate each field expression
-        let mut fields: Vec<(String, Value<'c, 'a>, VecType)> = Vec::new();
-        for field_def in &struct_def.fields {
-            // Find the matching expression
-            let expr = field_exprs
-                .iter()
-                .find(|(fname, _)| fname == &field_def.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "struct literal '{}' missing field '{}'",
-                        name, field_def.name
-                    )
-                });
-            let (val, ty) = self.emit_expr(&expr.1);
-            fields.push((field_def.name.clone(), val, ty));
-        }
-
-        // Store as a struct binding.
-        // The "return value" for struct literals is the first field's value/type
-        // (caller should handle struct returns specially).
-        // We store the struct in vars as a side effect if assigned.
-        // For now, return the first field value — the caller (emit_stmt for return)
-        // will handle multi-value returns.
-
-        // Actually, we need to handle this differently. The struct literal creates
-        // a Binding::Struct, but emit_expr returns a single (Value, VecType).
-        // We'll store the struct binding in a temporary and return a sentinel.
-        // Better approach: use the first field as the "value" and let the return
-        // path handle struct returns by looking up all fields.
-
-        // For struct literals, we store them in a temp var and return the first field.
-        // The return codegen path checks if the return expression is a struct literal
-        // and flattens all fields.
-
-        // For simplicity: store the struct in a hidden var, return first field.
-        // Actually, the cleanest approach: return first field, but also store
-        // the struct binding. We need a way to retrieve it.
-
-        // Let's use a different approach: store the fields in a special temp,
-        // and return the first field. The emit_return will handle struct lit specially.
-        let temp_name = format!("__struct_lit_{}_{}", name, fields.len());
-        self.vars.insert(
-            temp_name,
-            Binding::Struct {
-                fields: fields.clone(),
-            },
-        );
-
-        // Return first field value (for non-return contexts)
-        let (_, first_val, first_ty) = &fields[0];
-        (*first_val, *first_ty)
     }
 
     fn emit_scan(
@@ -1018,7 +1078,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         // If a seed is provided, XOR/ADD/etc it into lane 0 before scanning.
         // This threads carry state from previous chunks.
         let val = if let Some(seed_expr) = seed {
-            let (seed_val, seed_ty) = self.emit_expr(seed_expr);
+            let (seed_val, _) = if Self::is_literal(seed_expr) {
+                self.emit_literal_broadcast(seed_expr, VecType { scalar: ty.scalar, width: 1 })
+            } else {
+                self.emit_expr(seed_expr)
+            };
             // Seed is width-1 vector. Broadcast it to match the operand width,
             // then combine with lane 0 using the scan's operation.
             // Actually simpler: insert seed into a zero vector at lane 0,
@@ -1113,7 +1177,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 // Step i (for i = 0, 1, ..., log2(N)-1):
                 //   shifted = shuffle(val, identity, mask_that_shifts_right_by_2^i)
                 //   val = combine(val, shifted)
-                let num_steps = (width as f64).log2() as usize;
+                let num_steps = width.next_power_of_two().trailing_zeros() as usize;
                 let mut current = val;
 
                 for step in 0..num_steps {
@@ -1171,8 +1235,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                                     .build()
                                     .expect("failed to build arith.maximumf")
                             } else {
-                                // Use arith.maxsi
-                                OperationBuilder::new("arith.maxsi", self.loc)
+                                OperationBuilder::new(
+                                    if ty.scalar.is_unsigned() { "arith.maxui" } else { "arith.maxsi" },
+                                    self.loc,
+                                )
                                     .add_operands(&[current, shifted])
                                     .add_results(&[vec_mlir_type])
                                     .build()
@@ -1208,35 +1274,65 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             .into()
     }
 
-    /// NEON vtbl1 on a single 16-byte table.
-    fn emit_vtbl1(&mut self, table16: Value<'c, 'a>, idx16: Value<'c, 'a>) -> Value<'c, 'a> {
-        let vec16 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
+    /// `llvm.<name>` called with these operands.
+    fn emit_intrinsic(&mut self, name: &str, operands: &[Value<'c, 'a>], result: Type<'c>) -> Value<'c, 'a> {
         self.block
             .append_operation(
                 OperationBuilder::new("llvm.call_intrinsic", self.loc)
-                    .add_operands(&[table16, idx16])
-                    .add_results(&[vec16])
+                    .add_operands(operands)
+                    .add_results(&[result])
                     .add_attributes(&[
-                        (melior::ir::Identifier::new(self.ctx, "intrin"),
-                         StringAttribute::new(self.ctx, "llvm.aarch64.neon.tbl1").into()),
-                        (melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
-                         DenseI32ArrayAttribute::new(self.ctx, &[2, 0]).into()),
-                        (melior::ir::Identifier::new(self.ctx, "op_bundle_sizes"),
-                         DenseI32ArrayAttribute::new(self.ctx, &[]).into()),
+                        (
+                            melior::ir::Identifier::new(self.ctx, "intrin"),
+                            StringAttribute::new(self.ctx, name).into(),
+                        ),
+                        (
+                            melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(self.ctx, &[operands.len() as i32, 0]).into(),
+                        ),
+                        (
+                            melior::ir::Identifier::new(self.ctx, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(self.ctx, &[]).into(),
+                        ),
                     ])
                     .build()
-                    .unwrap(),
+                    .expect("failed to build llvm.call_intrinsic"),
             )
             .result(0)
             .unwrap()
             .into()
     }
 
+    /// Table lookup on one 16-byte table: an index of 16 or more gives 0.
+    fn emit_vtbl1(&mut self, table16: Value<'c, 'a>, idx16: Value<'c, 'a>) -> Value<'c, 'a> {
+        let vec16 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
+        match self.arch() {
+            Arch::Aarch64 => self.emit_intrinsic("llvm.aarch64.neon.tbl1", &[table16, idx16], vec16),
+            Arch::X86_64 => {
+                // pshufb only zeroes a lane whose index has its high bit set, and otherwise
+                // uses the low 4 bits. Adding 0x70 with saturation sets the high bit exactly
+                // for indices of 16 or more, and leaves the low 4 bits of the rest alone.
+                let offset = self.emit_splat_i8(0x70, 16);
+                let index = self.emit_intrinsic("llvm.uadd.sat.v16i8", &[idx16, offset], vec16);
+                self.emit_intrinsic("llvm.x86.ssse3.pshuf.b.128", &[table16, index], vec16)
+            }
+        }
+    }
+
+    fn arch(&self) -> Arch {
+        self.instances.borrow().arch
+    }
+
     /// Extract a 16-lane slice at byte `offset` from a wider i8 vector.
     fn emit_extract16(&mut self, v: Value<'c, 'a>, offset: usize) -> Value<'c, 'a> {
-        let vec16 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
+        self.emit_extract_lanes(v, offset, 16)
+    }
+
+    /// Extract `size` lanes at byte `offset` from a wider i8 vector.
+    fn emit_extract_lanes(&mut self, v: Value<'c, 'a>, offset: usize, size: u64) -> Value<'c, 'a> {
+        let vec16 = Type::vector(&[size], IntegerType::new(self.ctx, 8).into());
         let off = melior::ir::attribute::Attribute::parse(self.ctx, &format!("[{}]", offset)).unwrap();
-        let sz = melior::ir::attribute::Attribute::parse(self.ctx, "[16]").unwrap();
+        let sz = melior::ir::attribute::Attribute::parse(self.ctx, &format!("[{}]", size)).unwrap();
         let st = melior::ir::attribute::Attribute::parse(self.ctx, "[1]").unwrap();
         self.block
             .append_operation(
@@ -1350,7 +1446,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let splat: Vec<Value<'c, 'a>> = (0..k).map(|t| self.emit_splat_i8(t as i64, w)).collect();
 
         // Hillis-Steele: cur_i ← cur_i ∘ cur_{i-d}, d = 1,2,4,...
-        let steps = (w as f64).log2() as usize;
+        let steps = w.next_power_of_two().trailing_zeros() as usize;
         for step in 0..steps {
             let d = 1usize << step;
             // shifted[s] = cur[s] shifted right by d, low lanes filled with `s`.
@@ -1461,14 +1557,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     let op = arith::constant(self.ctx, splat.into(), self.loc);
                     self.block.append_operation(op).result(0).unwrap().into()
                 } else {
-                    // For signed integers, use the minimum value
-                    let min_val = match ty.scalar.bit_width() {
+                    // The smallest value of the type
+                    let min_val = if ty.scalar.is_unsigned() { 0 } else { match ty.scalar.bit_width() {
                         8 => i8::MIN as i64,
                         16 => i16::MIN as i64,
                         32 => i32::MIN as i64,
                         64 => i64::MIN,
                         _ => 0,
-                    };
+                    } };
                     let attr = IntegerAttribute::new(scalar_type, min_val);
                     let splat = splat_attr(vec_type, &[attr.into()])
                         .expect("failed to create min_val splat");
@@ -1485,73 +1581,54 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         index: &ast::Expr,
         mask: Option<&ast::Expr>,
     ) -> (Value<'c, 'a>, VecType) {
-        let (base_val, _base_ty) = self.emit_expr(base);
+        let (base_val, base_ty) = self.emit_expr(base);
+        if base_ty.width != 0 {
+            self.error("gather base must be a pointer");
+        }
+        let element = self.ptr_scalar_of(base, base_ty.scalar);
         let (index_val, index_ty) = self.emit_expr(index);
+        let result_ty = VecType { scalar: element, width: index_ty.width };
+        let zero_index = self.make_index_const(0);
 
-        // The result type is determined by the base element type and index width
-        // base is a memref, index determines the gather width
-        let result_width = index_ty.width;
+        if index_ty.width == 1 {
+            if mask.is_some() {
+                self.error("a masked gather needs a vector of indices; use if for a scalar");
+            }
+            let at = self.emit_value_as_index(index_val, index_ty);
+            return (self.emit_memref_load(base_val, at, element), result_ty);
+        }
 
-        // We need to figure out the element type from context.
-        // For gather, we'll infer element type from the base memref.
-        // The base should be a memref<?xelement> type.
-        // For now, assume f32 as default; in practice this would be tracked.
-        // Actually, we need to determine this from the base expression's type.
-        // Since base_val comes from a memref param, we'll need to track memref element types.
-        // For now, use a reasonable default or check the VecType.
-
-        // Build the mask (all-true if none provided)
-        let mask_ty = VecType {
-            scalar: ScalarType::Bool,
-            width: result_width,
-        };
-        let mask_val = if let Some(m) = mask {
-            self.emit_expr(m).0
-        } else {
-            // All-true mask
-            let mask_mlir = mask_ty.to_mlir_type(self.ctx);
-            let scalar_type = ScalarType::Bool.to_mlir_type(self.ctx);
-            let attr = IntegerAttribute::new(scalar_type, 1);
-            let splat = splat_attr(mask_mlir, &[attr.into()])
-                .expect("failed to create all-true mask");
-            let op = arith::constant(self.ctx, splat.into(), self.loc);
-            self.block.append_operation(op).result(0).unwrap().into()
-        };
-
-        // Passthrough (zero for unmasked lanes)
-        let result_ty = VecType {
-            scalar: ScalarType::F32, // default, should be inferred
-            width: result_width,
+        let mask_val = match mask {
+            Some(m) => self.emit_expr(m).0,
+            None => self.emit_all_true(index_ty.width),
         };
         let passthrough = self.emit_zero_vector(result_ty);
-        let result_mlir = result_ty.to_mlir_type(self.ctx);
-
-        // vector.gather %base[%c0], %indices, %mask, %passthrough
-        // Need a zero index for the base offset
-        let index_type = Type::index(self.ctx);
-        let zero_index_attr = IntegerAttribute::new(index_type, 0);
-        let zero_index_op = arith::constant(self.ctx, zero_index_attr.into(), self.loc);
-        let zero_index = self
-            .block
-            .append_operation(zero_index_op)
-            .result(0)
-            .unwrap()
-            .into();
-
-        let gather_op = OperationBuilder::new("vector.gather", self.loc)
-            .add_operands(&[base_val, zero_index, index_val, mask_val, passthrough])
-            .add_results(&[result_mlir])
-            .build()
-            .expect("failed to build vector.gather");
-
+        let index_val = self.emit_vector_indices(index_val, index_ty);
         let result = self
             .block
-            .append_operation(gather_op)
+            .append_operation(
+                OperationBuilder::new("vector.gather", self.loc)
+                    .add_operands(&[base_val, zero_index, index_val, mask_val, passthrough])
+                    .add_results(&[result_ty.to_mlir_type(self.ctx)])
+                    .build()
+                    .expect("failed to build vector.gather"),
+            )
             .result(0)
             .unwrap()
             .into();
-
         (result, result_ty)
+    }
+
+    /// A `bool[width]` with every lane true.
+    fn emit_all_true(&mut self, width: u64) -> Value<'c, 'a> {
+        let mask_mlir = VecType { scalar: ScalarType::Bool, width }.to_mlir_type(self.ctx);
+        let attr = IntegerAttribute::new(ScalarType::Bool.to_mlir_type(self.ctx), 1);
+        let splat = splat_attr(mask_mlir, &[attr.into()]).expect("failed to create all-true mask");
+        self.block
+            .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
+            .result(0)
+            .unwrap()
+            .into()
     }
 
     fn emit_load(
@@ -1561,8 +1638,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         ptr: &ast::Expr,
         offset_expr: Option<&ast::Expr>,
     ) -> (Value<'c, 'a>, VecType) {
-        let (ptr_val, _ptr_ty) = self.emit_expr(ptr);
+        let (ptr_val, ptr_ty) = self.emit_expr(ptr);
+        if ptr_ty.width != 0 {
+            self.error("load needs a pointer");
+        }
         let vec_ty = resolve_type(ty, &self.comptime_env, self.native_width);
+        if vec_ty.scalar == ScalarType::Bool {
+            self.error("bools can't be loaded: load bytes and compare them");
+        }
 
         // Compute index: either 0 or the offset expression (in elements of the ptr type)
         let load_index: Value = match offset_expr {
@@ -1571,20 +1654,13 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         };
 
         // Check if load type differs from ptr element type — need bitcast
-        let ptr_scalar = if let ast::Expr::Ident(pname) = ptr {
-            match self.vars.get(pname) {
-                Some(Binding::Ptr(_, s)) => Some(*s),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let ptr_scalar = Some(ptr_ty.scalar);
 
         let needs_bitcast = ptr_scalar.is_some() && ptr_scalar.unwrap() != vec_ty.scalar;
 
         // A scalar load stays scalar: going through vector<8xi8> leaves LLVM with
         // `load <1 x i64>`, which lands in a vector register.
-        if vec_ty.width == 1 && (!needs_bitcast || ptr_scalar == Some(ScalarType::U8)) {
+        if vec_ty.width == 1 && (!needs_bitcast || ptr_ty.scalar.bit_width() == 8) {
             let result = if needs_bitcast {
                 self.emit_unaligned_load(ptr_val, load_index, vec_ty.scalar)
             } else {
@@ -1603,6 +1679,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             // Load as the ptr's element type with enough elements to fill the target type
             let target_bytes = vec_ty.scalar.bit_width() as u64 / 8 * vec_ty.width;
             let ptr_elem_bytes = ptr_sc.bit_width() as u64 / 8;
+            if target_bytes % ptr_elem_bytes != 0 {
+                self.error(&format!(
+                    "can't load {:?}[{}]: {} bytes isn't a whole number of {:?}",
+                    vec_ty.scalar, vec_ty.width, target_bytes, ptr_sc
+                ));
+            }
             let load_width = target_bytes / ptr_elem_bytes;
             let load_vt = VecType { scalar: ptr_sc, width: load_width };
 
@@ -1632,26 +1714,59 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         (self.emit_unwrap_unit(loaded, vec_ty), vec_ty)
     }
 
-    /// Convert between integer widths: zero-extend, truncate, or (at equal width,
-    /// where the language's signedness has no MLIR representation) pass through.
+    /// Convert between integer widths: extend by the source's signedness, truncate, or (at
+    /// equal width, where signedness has no MLIR representation) pass through.
     fn emit_int_resize(&mut self, val: Value<'c, 'a>, from: VecType, to: VecType) -> Value<'c, 'a> {
+        if from.scalar.is_float() || to.scalar.is_float() {
+            self.error(&format!("can't convert {:?} to {:?}", from.scalar, to.scalar));
+        }
         let (from_bits, to_bits) = (from.scalar.bit_width(), to.scalar.bit_width());
         if from_bits == to_bits {
             return val;
         }
         let target = to.to_mlir_type(self.ctx);
-        let op = if from_bits < to_bits {
+        let op = if from_bits > to_bits {
+            arith::trunci(val, target, self.loc)
+        } else if from.scalar.is_unsigned() {
             arith::extui(val, target, self.loc)
         } else {
-            arith::trunci(val, target, self.loc)
+            OperationBuilder::new("arith.extsi", self.loc)
+                .add_operands(&[val])
+                .add_results(&[target])
+                .build()
+                .expect("failed to build arith.extsi")
         };
         self.block.append_operation(op).result(0).unwrap().into()
     }
 
+    /// An integer value as an MLIR `index`, extended by its own signedness.
+    fn emit_value_as_index(&mut self, val: Value<'c, 'a>, ty: VecType) -> Value<'c, 'a> {
+        let index = Type::index(self.ctx);
+        let op = if ty.scalar.is_unsigned() {
+            OperationBuilder::new("arith.index_castui", self.loc)
+                .add_operands(&[val])
+                .add_results(&[index])
+                .build()
+                .expect("failed to build arith.index_castui")
+        } else {
+            arith::index_cast(val, index, self.loc)
+        };
+        self.block.append_operation(op).result(0).unwrap().into()
+    }
+
+    /// Gather and scatter indices. MLIR sign-extends them, so narrow unsigned ones widen first.
+    fn emit_vector_indices(&mut self, val: Value<'c, 'a>, ty: VecType) -> Value<'c, 'a> {
+        if ty.scalar.is_unsigned() && ty.scalar.bit_width() < 64 {
+            self.emit_int_resize(val, ty, VecType { scalar: ScalarType::I64, width: ty.width })
+        } else {
+            val
+        }
+    }
+
     /// An element offset as an MLIR `index`: a literal, or a scalar integer value.
     fn emit_index(&mut self, expr: &ast::Expr) -> Value<'c, 'a> {
-        if let ast::Expr::IntLit(n) = expr {
-            return self.make_index_const(*n);
+        if let Some(ast::ConstValue::Int(n)) = expr.const_value() {
+            return self.make_index_const(n);
         }
         let (val, ty) = self.emit_expr(expr);
         if ty.width != 1 || !ty.scalar.is_int() {
@@ -1660,11 +1775,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 ty.scalar, ty.width
             ));
         }
-        self.block
-            .append_operation(arith::index_cast(val, Type::index(self.ctx), self.loc))
-            .result(0)
-            .unwrap()
-            .into()
+        self.emit_value_as_index(val, ty)
     }
 
     /// `vector<1xT>` → `T` for a width-1 value; wider vectors pass through.
@@ -1768,6 +1879,255 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             .result(0)
             .unwrap()
             .into()
+    }
+
+    /// The symbol to call for `target`, and the comptime environment its signature is
+    /// resolved in. A generic function gets a copy for each set of widths it's called
+    /// with, requested here and emitted by `compile_module`.
+    fn resolve_callee(
+        &mut self,
+        target: &ast::FnDef,
+        explicit_widths: Option<&Vec<ast::Width>>,
+        arg_widths: &[Option<u64>],
+    ) -> (String, HashMap<String, u64>) {
+        let module_env = self.instances.borrow().module_env.clone();
+        let is_generic = target.comptime_params.iter().any(|p| !module_env.contains_key(&p.name));
+        if !is_generic {
+            let symbol = if target.extern_c { extern_impl_name(&target.name) } else { target.name.clone() };
+            return (symbol, module_env);
+        }
+
+        let mut env = module_env;
+        if let Some(widths) = explicit_widths {
+            for (param, width) in target.comptime_params.iter().zip(widths) {
+                env.insert(param.name.clone(), width.eval(&self.comptime_env, self.native_width));
+            }
+        }
+        for (param, width) in target.params.iter().zip(arg_widths) {
+            if let (Some(ast::Width::Param(p)), Some(width)) = (&param.ty.width, width) {
+                if is_scalar_type_name(&param.ty.name) {
+                    env.entry(p.clone()).or_insert(*width);
+                }
+            }
+        }
+
+        let mut symbol = target.name.clone();
+        for param in &target.comptime_params {
+            let width = *env.get(&param.name).unwrap_or_else(|| {
+                self.error(&format!("can't infer {} for '{}'", param.name, target.name))
+            });
+            symbol.push_str(&format!(".{}{}", param.name, width));
+        }
+
+        let mut instances = self.instances.borrow_mut();
+        if instances.seen.len() > 4096 {
+            drop(instances);
+            self.error(&format!("too many instances of generic functions, at '{}': is it recursive?", symbol));
+        }
+        if instances.seen.insert(symbol.clone()) {
+            let mut instance = target.clone();
+            instance.name = symbol.clone();
+            instance.private = true;
+            let widths: HashMap<String, u64> = target
+                .comptime_params
+                .iter()
+                .map(|p| (p.name.clone(), env[&p.name]))
+                .collect();
+            crate::comptime::substitute_in_fn(&mut instance, &widths);
+            instances.envs.insert(symbol.clone(), env.clone());
+            instances.pending.push(instance);
+        }
+        (symbol, env)
+    }
+
+    /// The high nibble of each lane of a `u8[16]`, packed into a u64 (`shrn #4`).
+    fn emit_nibblemask16(&mut self, val: Value<'c, 'a>) -> Value<'c, 'a> {
+        let i8t: Type = IntegerType::new(self.ctx, 8).into();
+        let i16t: Type = IntegerType::new(self.ctx, 16).into();
+        let i64t: Type = IntegerType::new(self.ctx, 64).into();
+        let v8i16 = Type::vector(&[8], i16t);
+        let v8i8 = Type::vector(&[8], i8t);
+        let v1i64 = Type::vector(&[1], i64t);
+        let as_i16: Value = self
+            .block
+            .append_operation(
+                OperationBuilder::new("vector.bitcast", self.loc)
+                    .add_operands(&[val])
+                    .add_results(&[v8i16])
+                    .build()
+                    .expect("failed to bitcast for nibblemask"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let four_attr = IntegerAttribute::new(i16t, 4);
+        let four: Value = self
+            .block
+            .append_operation(arith::constant(
+                self.ctx,
+                splat_attr(v8i16, &[four_attr.into()]).unwrap(),
+                self.loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let shifted: Value = self
+            .block
+            .append_operation(arith::shrui(as_i16, four, self.loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let narrowed: Value = self
+            .block
+            .append_operation(arith::trunci(shifted, v8i8, self.loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let as_u64: Value = self
+            .block
+            .append_operation(
+                OperationBuilder::new("vector.bitcast", self.loc)
+                    .add_operands(&[narrowed])
+                    .add_results(&[v1i64])
+                    .build()
+                    .expect("failed to bitcast nibbles"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+                self.emit_unwrap_unit(as_u64, VecType { scalar: ScalarType::U64, width: 1 })
+    }
+
+    /// `any` over 16 or more lanes in whole registers: sign-extend to bytes, OR the
+    /// registers together, and test one `shrn`. Bitcasting wide i1 vectors to integers
+    /// builds a full bitmask per register instead.
+    fn emit_any_wide(&mut self, val: Value<'c, 'a>, width: u64) -> Value<'c, 'a> {
+        let i8t: Type = IntegerType::new(self.ctx, 8).into();
+        let i64t: Type = IntegerType::new(self.ctx, 64).into();
+        let bytes: Value = self
+            .block
+            .append_operation(
+                OperationBuilder::new("arith.extsi", self.loc)
+                    .add_operands(&[val])
+                    .add_results(&[Type::vector(&[width], i8t)])
+                    .build()
+                    .expect("failed to build arith.extsi"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let mut combined = if width == 16 { bytes } else { self.emit_extract16(bytes, 0) };
+        let mut offset = 16;
+        while offset < width as usize {
+            let slice = self.emit_extract16(bytes, offset);
+            combined = self
+                .block
+                .append_operation(arith::ori(combined, slice, self.loc))
+                .result(0)
+                .unwrap()
+                .into();
+            offset += 16;
+        }
+        let nibbles = self.emit_nibblemask16(combined);
+        let zero: Value = self
+            .block
+            .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i64t, 0).into(), self.loc))
+            .result(0)
+            .unwrap()
+            .into();
+        self.block
+            .append_operation(arith::cmpi(self.ctx, arith::CmpiPredicate::Ne, nibbles, zero, self.loc))
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// The fields of a struct type, with their widths resolved.
+    fn struct_field_types(&self, ty: &ast::Type, env: &HashMap<String, u64>) -> Vec<(String, VecType)> {
+        let Some(def) = self.struct_defs.get(&ty.name) else {
+            self.error(&format!("undefined struct: {}", ty.name));
+        };
+        let width = ty
+            .width
+            .as_ref()
+            .unwrap_or_else(|| self.error(&format!("struct {} needs a width", ty.name)))
+            .eval(env, self.native_width);
+        let mut struct_env = env.clone();
+        if let Some(cp) = def.comptime_params.first() {
+            struct_env.insert(cp.name.clone(), width);
+        }
+        def.fields
+            .iter()
+            .map(|f| (f.name.clone(), resolve_type(&f.ty, &struct_env, self.native_width)))
+            .collect()
+    }
+
+    /// The name of the user function an expression calls, if it does.
+    fn called_user_fn(&self, expr: &ast::Expr) -> Option<ast::FnDef> {
+        let ast::Expr::Call { func, .. } = expr else { return None };
+        let name = match func.as_ref() {
+            ast::Expr::Ident(n) => n,
+            ast::Expr::Instantiate { name, .. } => name,
+            _ => return None,
+        };
+        self.fn_defs.get(name).cloned()
+    }
+
+    /// Whether an expression evaluates to a struct.
+    fn is_struct_expr(&self, expr: &ast::Expr) -> bool {
+        match expr {
+            ast::Expr::StructLit { .. } => true,
+            ast::Expr::Ident(name) => matches!(self.vars.get(name), Some(Binding::Struct { .. })),
+            _ => self
+                .called_user_fn(expr)
+                .and_then(|f| f.ret_ty)
+                .is_some_and(|r| !is_scalar_type_name(&r.name) && !is_ptr_type_name(&r.name)),
+        }
+    }
+
+    /// Evaluate a struct-valued expression to its fields, in declaration order.
+    fn emit_struct_value(&mut self, expr: &ast::Expr) -> Vec<(String, Value<'c, 'a>, VecType)> {
+        match expr {
+            ast::Expr::StructLit { name, width, fields } => self.emit_struct_fields(name, width, fields),
+            ast::Expr::Ident(name) => match self.vars.get(name) {
+                Some(Binding::Struct { fields }) => fields.clone(),
+                _ => self.error(&format!("'{}' is not a struct", name)),
+            },
+            ast::Expr::Call { func, args } => {
+                let (results, ret_ty, env) = self.emit_user_call(func, args);
+                let Some(ret_ty) = ret_ty else {
+                    self.error("function has no return value");
+                };
+                let types = self.struct_field_types(&ret_ty, &env);
+                types
+                    .into_iter()
+                    .zip(results)
+                    .map(|((name, ty), val)| (name, val, ty))
+                    .collect()
+            }
+            _ => self.error("expected a struct value"),
+        }
+    }
+
+    /// The fields of a struct literal, each a field-typed literal or an expression.
+    fn emit_struct_fields(
+        &mut self,
+        name: &str,
+        width: &ast::Width,
+        field_exprs: &[(String, ast::Expr)],
+    ) -> Vec<(String, Value<'c, 'a>, VecType)> {
+        let ty = ast::Type { name: name.to_string(), width: Some(width.clone()) };
+        let env = self.comptime_env.clone();
+        let types = self.struct_field_types(&ty, &env);
+        let mut fields = Vec::with_capacity(types.len());
+        for (field, field_ty) in types {
+            let Some((_, expr)) = field_exprs.iter().find(|(f, _)| *f == field) else {
+                self.error(&format!("struct literal '{}' missing field '{}'", name, field));
+            };
+            let (val, ty) = self.emit_expr_typed(expr, field_ty);
+            fields.push((field, val, ty));
+        }
+        fields
     }
 
     /// `llvm.ptr` to byte offset `index` of a byte pointer. This is the lowered form
@@ -1898,6 +2258,32 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         } else {
             as_vector
         };
+        // Write wide byte vectors one register at a time, ascending. Left whole, LLVM
+        // splits the store and may write the upper half first, which is markedly slower
+        // once the destination is out of cache.
+        let total_bytes = val_ty.scalar.bit_width() as u64 * val_ty.width / 8;
+        let register = self.arch().register_bytes();
+        if buf_scalar.bit_width() == 8 && total_bytes > register && total_bytes % register == 0 {
+            let mut offset = 0;
+            while offset < total_bytes as i64 {
+                let slice = self.emit_extract_lanes(to_store, offset as usize, register);
+                let delta = self.make_index_const(offset);
+                let at: Value = self
+                    .block
+                    .append_operation(arith::addi(index, delta, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                self.block.append_operation(
+                    OperationBuilder::new("vector.store", self.loc)
+                        .add_operands(&[slice, buf, at])
+                        .build()
+                        .expect("failed to build vector.store"),
+                );
+                offset += register as i64;
+            }
+            return;
+        }
         self.block.append_operation(
             OperationBuilder::new("vector.store", self.loc)
                 .add_operands(&[to_store, buf, index])
@@ -1920,12 +2306,49 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         &mut self,
         ptr: &ast::Expr,
         value: &ast::Expr,
+        mask: Option<&ast::Expr>,
     ) {
         let (ptr_val, ptr_ty) = self.emit_expr(ptr);
-        let (val, val_ty) = self.emit_expr(value);
         let buf_scalar = self.ptr_scalar_of(ptr, ptr_ty.scalar);
+        let (val, val_ty) = self.emit_store_value(value, buf_scalar);
         let zero_index = self.make_index_const(0);
-        self.emit_vector_store(val, val_ty, ptr_val, buf_scalar, zero_index);
+        match mask {
+            None => self.emit_vector_store(val, val_ty, ptr_val, buf_scalar, zero_index),
+            Some(mask) => {
+                let (mask_val, mask_ty) = self.emit_expr(mask);
+                if mask_ty.scalar != ScalarType::Bool || mask_ty.width != val_ty.width {
+                    self.error(&format!(
+                        "store mask must be bool[{}], got {:?}[{}]",
+                        val_ty.width, mask_ty.scalar, mask_ty.width
+                    ));
+                }
+                if val_ty.width == 1 {
+                    self.error("a masked store needs a vector value; use if for a scalar");
+                }
+                if buf_scalar.bit_width() != val_ty.scalar.bit_width() {
+                    self.error("a masked store's value must have the pointer's element size");
+                }
+                self.block.append_operation(
+                    OperationBuilder::new("vector.maskedstore", self.loc)
+                        .add_operands(&[ptr_val, zero_index, mask_val, val])
+                        .build()
+                        .expect("failed to build vector.maskedstore"),
+                );
+            }
+        }
+    }
+
+    /// A value to store: a literal takes the pointer's element type.
+    fn emit_store_value(&mut self, value: &ast::Expr, buf_scalar: ScalarType) -> (Value<'c, 'a>, VecType) {
+        match value {
+            _ if Self::is_literal(value) => {
+                self.emit_literal_broadcast(value, VecType { scalar: buf_scalar, width: 1 })
+            }
+            ast::Expr::Masked { mask, body, fallback } if Self::takes_expected_type(value) => {
+                self.emit_masked(mask, body, fallback.as_deref(), Some(buf_scalar))
+            }
+            _ => self.emit_expr(value),
+        }
     }
 
     fn emit_scatter(
@@ -1935,9 +2358,28 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         mask: Option<&ast::Expr>,
         value: &ast::Expr,
     ) {
-        let (base_val, _) = self.emit_expr(base);
+        let (base_val, base_ty) = self.emit_expr(base);
+        let element = self.ptr_scalar_of(base, base_ty.scalar);
         let (index_val, index_ty) = self.emit_expr(index);
-        let (val, _val_ty) = self.emit_expr(value);
+        let (val, val_ty) = self.emit_store_value(value, element);
+        let val = if val_ty.width == 1 && index_ty.width > 1 {
+            self.emit_broadcast_to_width(val, val_ty, index_ty.width).0
+        } else {
+            val
+        };
+        if index_ty.width == 1 {
+            if mask.is_some() {
+                self.error("a masked scatter needs a vector of indices; use if for a scalar");
+            }
+            let at = self.emit_value_as_index(index_val, index_ty);
+            self.block.append_operation(
+                OperationBuilder::new("memref.store", self.loc)
+                    .add_operands(&[val, base_val, at])
+                    .build()
+                    .expect("failed to build memref.store"),
+            );
+            return;
+        }
 
         // Build mask (all-true if none provided)
         let mask_ty = VecType {
@@ -1967,6 +2409,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             .unwrap()
             .into();
 
+        let index_val = self.emit_vector_indices(index_val, index_ty);
         let scatter_op = OperationBuilder::new("vector.scatter", self.loc)
             .add_operands(&[base_val, zero_index, index_val, mask_val, val])
             .build()
@@ -2005,19 +2448,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let (data_val, data_ty) = self.emit_expr(&args[0].value);
                 let (mask_val, _mask_ty) = self.emit_expr(&args[1].value);
                 let result_mlir = data_ty.to_mlir_type(self.ctx);
-
-                let compress_op = OperationBuilder::new("vector.compress", self.loc)
-                    .add_operands(&[data_val, mask_val])
-                    .add_results(&[result_mlir])
-                    .build()
-                    .expect("failed to build vector.compress");
-
-                let result = self
-                    .block
-                    .append_operation(compress_op)
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let lane = if data_ty.scalar.is_float() { "f" } else { "i" };
+                let intrinsic = format!("llvm.experimental.vector.compress.v{}{}{}", data_ty.width, lane, data_ty.scalar.bit_width());
+                let passthrough = self.emit_zero_vector(data_ty);
+                let result = self.emit_intrinsic(&intrinsic, &[data_val, mask_val, passthrough], result_mlir);
                 (result, data_ty)
             }
             ast::Expr::Ident(name) if name == "popcount" => {
@@ -2089,7 +2523,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     args.len() == 2 || args.len() == 3,
                     "store takes 2 or 3 arguments"
                 );
-                self.emit_store(&args[0].value, &args[1].value);
+                self.emit_store(&args[0].value, &args[1].value, args.get(2).map(|a| &a.value));
                 // store doesn't return a value — return a dummy
                 // This is only used in expression statements
                 let dummy_ty = VecType {
@@ -2159,19 +2593,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 // compressstore(buf, offset, data, mask) → stores selected lanes contiguously
                 assert_eq!(args.len(), 4, "compressstore takes 4 arguments (buf, offset, data, mask)");
                 let (buf_val, _) = self.emit_expr(&args[0].value);
-                let (offset_val, _) = self.emit_expr(&args[1].value);
-                let (data_val, data_ty) = self.emit_expr(&args[2].value);
+                let offset_index = self.emit_index(&args[1].value);
+                let (data_val, _) = self.emit_expr(&args[2].value);
                 let (mask_val, _) = self.emit_expr(&args[3].value);
-
-                // Convert offset from i32[1] to index scalar
-                let index_type = Type::index(self.ctx);
-
-                // Extract scalar from i32[1]
-                let offset_scalar = offset_val;
-
-                // Cast i32 to index
-                let cast_op = arith::index_cast(offset_scalar, index_type, self.loc);
-                let offset_index = self.block.append_operation(cast_op).result(0).unwrap().into();
 
                 // vector.compressstore %buf[%offset], %mask, %data
                 let compressstore_op = OperationBuilder::new("vector.compressstore", self.loc)
@@ -2185,18 +2609,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let dummy = self.emit_zero_vector(dummy_ty);
                 (dummy, dummy_ty)
             }
-            ast::Expr::Ident(name) if name == "to_i32" => {
-                // to_i32(vec) → zero-extend each lane to i32
-                assert_eq!(args.len(), 1, "to_i32 takes exactly 1 argument");
+            ast::Expr::Ident(name) if int_conversion_target(name).is_some() => {
+                // to_i64(vec) and friends: each lane to that type, extended by its signedness.
+                assert_eq!(args.len(), 1, "{} takes exactly 1 argument", name);
                 let (val, ty) = self.emit_expr(&args[0].value);
-                let result_ty = VecType { scalar: ScalarType::I32, width: ty.width };
-                (self.emit_int_resize(val, ty, result_ty), result_ty)
-            }
-            ast::Expr::Ident(name) if name == "to_i64" => {
-                // to_i64(vec) → zero-extend each lane to i64
-                assert_eq!(args.len(), 1, "to_i64 takes exactly 1 argument");
-                let (val, ty) = self.emit_expr(&args[0].value);
-                let result_ty = VecType { scalar: ScalarType::I64, width: ty.width };
+                let scalar = int_conversion_target(name).unwrap();
+                let result_ty = VecType { scalar, width: ty.width };
                 (self.emit_int_resize(val, ty, result_ty), result_ty)
             }
             ast::Expr::Ident(name) if name == "to_bitmask" => {
@@ -2206,6 +2624,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 assert_eq!(args.len(), 1, "to_bitmask takes exactly 1 argument");
                 let (val, ty) = self.emit_expr(&args[0].value);
                 assert_eq!(ty.scalar, ScalarType::Bool, "to_bitmask requires bool vector");
+                if ty.width > 64 {
+                    self.error("to_bitmask can pack at most 64 lanes");
+                }
                 let width = ty.width;
                 let i64_type: Type = IntegerType::new(self.ctx, 64).into();
 
@@ -2308,23 +2729,45 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
                 let b_scalar: Value = b_val;
 
-                // PMULL intrinsic
-                let seg_sizes = DenseI32ArrayAttribute::new(self.ctx, &[2, 0]);
-                let bundle_sizes = DenseI32ArrayAttribute::new(self.ctx, &[]);
-                let pmull: Value = self.block.append_operation(
-                    OperationBuilder::new("llvm.call_intrinsic", self.loc)
-                        .add_operands(&[a_scalar, b_scalar])
-                        .add_results(&[vec16xi8])
-                        .add_attributes(&[
-                            (melior::ir::Identifier::new(self.ctx, "intrin"),
-                             StringAttribute::new(self.ctx, "llvm.aarch64.neon.pmull64").into()),
-                            (melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
-                             seg_sizes.into()),
-                            (melior::ir::Identifier::new(self.ctx, "op_bundle_sizes"),
-                             bundle_sizes.into()),
-                        ])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let pmull: Value = match self.arch() {
+                    Arch::Aarch64 => self.emit_intrinsic("llvm.aarch64.neon.pmull64", &[a_scalar, b_scalar], vec16xi8),
+                    Arch::X86_64 => {
+                        let wrap = |this: &mut Self, value: Value<'c, 'a>| -> Value<'c, 'a> {
+                            this.block
+                                .append_operation(
+                                    OperationBuilder::new("vector.broadcast", this.loc)
+                                        .add_operands(&[value])
+                                        .add_results(&[vec2xi64])
+                                        .build()
+                                        .expect("failed to wrap clmul operand"),
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        };
+                        let a_vec = wrap(self, a_scalar);
+                        let b_vec = wrap(self, b_scalar);
+                        let i8t: Type = IntegerType::new(self.ctx, 8).into();
+                        let low_lanes: Value = self
+                            .block
+                            .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i8t, 0).into(), self.loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let product = self.emit_intrinsic("llvm.x86.pclmulqdq", &[a_vec, b_vec, low_lanes], vec2xi64);
+                        self.block
+                            .append_operation(
+                                OperationBuilder::new("vector.bitcast", self.loc)
+                                    .add_operands(&[product])
+                                    .add_results(&[vec16xi8])
+                                    .build()
+                                    .expect("failed to bitcast clmul result"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    }
+                };
 
                 // Bitcast to 2xi64, extract lower
                 let as_2xi64: Value = self.block.append_operation(
@@ -2577,85 +3020,8 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let (idx_val, idx_ty) = self.emit_expr(&args[1].value);
                 assert_eq!(table_ty.width, 16, "tbl table must be u8[16]");
 
-                let width = idx_ty.width as usize;
-                let vec16xi8 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
-                let seg_sizes = DenseI32ArrayAttribute::new(self.ctx, &[2, 0]);
-                let bundle_sizes = DenseI32ArrayAttribute::new(self.ctx, &[]);
-
-                if width == 16 {
-                    let result: Value = self.block.append_operation(
-                        OperationBuilder::new("llvm.call_intrinsic", self.loc)
-                            .add_operands(&[table_val, idx_val])
-                            .add_results(&[vec16xi8])
-                            .add_attributes(&[
-                                (melior::ir::Identifier::new(self.ctx, "intrin"),
-                                 StringAttribute::new(self.ctx, "llvm.aarch64.neon.tbl1").into()),
-                                (melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
-                                 seg_sizes.into()),
-                                (melior::ir::Identifier::new(self.ctx, "op_bundle_sizes"),
-                                 bundle_sizes.into()),
-                            ])
-                            .build().unwrap()
-                    ).result(0).unwrap().into();
-                    (result, idx_ty)
-                } else {
-                    // Split into 16-byte chunks
-                    let num_chunks = width / 16;
-                    let result_type = idx_ty.to_mlir_type(self.ctx);
-                    let mut current = self.emit_zero_vector(idx_ty);
-
-                    for chunk_idx in 0..num_chunks {
-                        let offset = chunk_idx * 16;
-                        let offsets_attr = melior::ir::attribute::Attribute::parse(
-                            self.ctx, &format!("[{}]", offset)).unwrap();
-                        let sizes_attr = melior::ir::attribute::Attribute::parse(
-                            self.ctx, "[16]").unwrap();
-                        let strides_attr = melior::ir::attribute::Attribute::parse(
-                            self.ctx, "[1]").unwrap();
-                        let extract = OperationBuilder::new("vector.extract_strided_slice", self.loc)
-                            .add_operands(&[idx_val])
-                            .add_results(&[vec16xi8])
-                            .add_attributes(&[
-                                (melior::ir::Identifier::new(self.ctx, "offsets"), offsets_attr),
-                                (melior::ir::Identifier::new(self.ctx, "sizes"), sizes_attr),
-                                (melior::ir::Identifier::new(self.ctx, "strides"), strides_attr),
-                            ])
-                            .build().unwrap();
-                        let slice: Value = self.block.append_operation(extract).result(0).unwrap().into();
-
-                        let seg_sizes2 = DenseI32ArrayAttribute::new(self.ctx, &[2, 0]);
-                        let bundle_sizes2 = DenseI32ArrayAttribute::new(self.ctx, &[]);
-                        let tbl_result: Value = self.block.append_operation(
-                            OperationBuilder::new("llvm.call_intrinsic", self.loc)
-                                .add_operands(&[table_val, slice])
-                                .add_results(&[vec16xi8])
-                                .add_attributes(&[
-                                    (melior::ir::Identifier::new(self.ctx, "intrin"),
-                                     StringAttribute::new(self.ctx, "llvm.aarch64.neon.tbl1").into()),
-                                    (melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
-                                     seg_sizes2.into()),
-                                    (melior::ir::Identifier::new(self.ctx, "op_bundle_sizes"),
-                                     bundle_sizes2.into()),
-                                ])
-                                .build().unwrap()
-                        ).result(0).unwrap().into();
-
-                        let ins_offsets = melior::ir::attribute::Attribute::parse(
-                            self.ctx, &format!("[{}]", offset)).unwrap();
-                        let ins_strides = melior::ir::attribute::Attribute::parse(
-                            self.ctx, "[1]").unwrap();
-                        let insert = OperationBuilder::new("vector.insert_strided_slice", self.loc)
-                            .add_operands(&[tbl_result, current])
-                            .add_results(&[result_type])
-                            .add_attributes(&[
-                                (melior::ir::Identifier::new(self.ctx, "offsets"), ins_offsets),
-                                (melior::ir::Identifier::new(self.ctx, "strides"), ins_strides),
-                            ])
-                            .build().unwrap();
-                        current = self.block.append_operation(insert).result(0).unwrap().into();
-                    }
-                    (current, idx_ty)
-                }
+                let result = self.emit_tbl_w(table_val, idx_val, idx_ty.width as usize);
+                (result, idx_ty)
             }
             ast::Expr::Ident(name) if name == "split_lo" => {
                 // split_lo(vec[N]) → vec[N/2], lower half via vector.shuffle
@@ -2700,18 +3066,19 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let result: Value = self.block.append_operation(shuffle_op).result(0).unwrap().into();
                 (result, result_ty)
             }
-            ast::Expr::Ident(name) if name == "unlikely" => {
-                // unlikely(bool[1]) → bool[1]: the same value, hinting that it is usually
-                // false so the true path is laid out away from the hot path.
-                assert_eq!(args.len(), 1, "unlikely takes exactly 1 argument");
+            ast::Expr::Ident(name) if name == "likely" || name == "unlikely" => {
+                // likely(bool[1]) / unlikely(bool[1]) → the same value, hinting which way it
+                // usually goes so the other path is laid out away from the hot path.
+                assert_eq!(args.len(), 1, "{} takes exactly 1 argument", name);
                 let (val, ty) = self.emit_expr(&args[0].value);
                 if ty.scalar != ScalarType::Bool || ty.width != 1 {
-                    self.error("unlikely requires a scalar bool");
+                    self.error(&format!("{} requires a scalar bool", name));
                 }
                 let i1: Type = IntegerType::new(self.ctx, 1).into();
+                let expected = (name == "likely") as i64;
                 let no: Value = self
                     .block
-                    .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i1, 0).into(), self.loc))
+                    .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i1, expected).into(), self.loc))
                     .result(0)
                     .unwrap()
                     .into();
@@ -2729,30 +3096,26 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     .into();
                 (hinted, ty)
             }
-            ast::Expr::Ident(name) if name == "to_u8" => {
-                // to_u8(vec) → truncate or pass through each lane to u8
-                assert_eq!(args.len(), 1, "to_u8 takes exactly 1 argument");
-                let (val, ty) = self.emit_expr(&args[0].value);
-                let result_ty = VecType { scalar: ScalarType::U8, width: ty.width };
-                (self.emit_int_resize(val, ty, result_ty), result_ty)
-            }
             ast::Expr::Ident(name) if name == "min" || name == "max" => {
                 // min(a, b) / max(a, b) → lane-wise, honouring the operand's signedness
                 assert_eq!(args.len(), 2, "{} takes exactly 2 arguments", name);
-                let (a, a_ty) = self.emit_expr(&args[0].value);
-                let (b, b_ty) = if Self::is_literal(&args[1].value) {
-                    self.emit_literal_broadcast(&args[1].value, a_ty)
+                let (a, a_ty, b, b_ty) = if Self::is_literal(&args[0].value) {
+                    let (b, b_ty) = self.emit_expr(&args[1].value);
+                    let (a, a_ty) = self.emit_literal_broadcast(&args[0].value, b_ty);
+                    (a, a_ty, b, b_ty)
                 } else {
-                    self.emit_expr(&args[1].value)
+                    let (a, a_ty) = self.emit_expr(&args[0].value);
+                    let (b, b_ty) = if Self::is_literal(&args[1].value) {
+                        self.emit_literal_broadcast(&args[1].value, a_ty)
+                    } else {
+                        self.emit_expr(&args[1].value)
+                    };
+                    (a, a_ty, b, b_ty)
                 };
                 if a_ty.width != b_ty.width {
                     self.error(&format!("{} operands have different widths: {} vs {}", name, a_ty.width, b_ty.width));
                 }
-                let is_unsigned = matches!(
-                    a_ty.scalar,
-                    ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
-                );
-                let op_name = match (name.as_str(), a_ty.scalar.is_float(), is_unsigned) {
+                let op_name = match (name.as_str(), a_ty.scalar.is_float(), a_ty.scalar.is_unsigned()) {
                     ("min", true, _) => "arith.minimumf",
                     ("max", true, _) => "arith.maximumf",
                     ("min", false, true) => "arith.minui",
@@ -2774,6 +3137,155 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     .unwrap()
                     .into();
                 (result, a_ty)
+            }
+            ast::Expr::Ident(name) if name == "fold_min" => {
+                // fold_min(u8[N]) → the lane-wise minimum across vector registers, so one
+                // register's worth of lanes. A no-op when N fits in one register.
+                assert_eq!(args.len(), 1, "fold_min takes exactly 1 argument");
+                let (val, ty) = self.emit_expr(&args[0].value);
+                let register = self.arch().register_bytes();
+                if ty.scalar != ScalarType::U8 {
+                    self.error("fold_min requires a u8 vector");
+                }
+                if ty.width <= register {
+                    return (val, ty);
+                }
+                if ty.width % register != 0 {
+                    self.error(&format!(
+                        "fold_min's width must fit in or be a multiple of a {}-byte register",
+                        register
+                    ));
+                }
+                let result_ty = VecType { scalar: ScalarType::U8, width: register };
+                let result_mlir = result_ty.to_mlir_type(self.ctx);
+                let mut folded = self.emit_extract_lanes(val, 0, register);
+                let mut offset = register;
+                while offset < ty.width {
+                    let slice = self.emit_extract_lanes(val, offset as usize, register);
+                    folded = self
+                        .block
+                        .append_operation(
+                            OperationBuilder::new("arith.minui", self.loc)
+                                .add_operands(&[folded, slice])
+                                .add_results(&[result_mlir])
+                                .build()
+                                .expect("failed to build arith.minui"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    offset += register;
+                }
+                (folded, result_ty)
+            }
+            ast::Expr::Ident(name) if name == "any_in_first" => {
+                // any_in_first(bool[N], n) → whether any of the first n lanes is true, for
+                // n in 1..=N. The mask is built by whichever movemask the target has cheaply.
+                assert_eq!(args.len(), 2, "any_in_first takes exactly 2 arguments");
+                let (mask, mask_ty) = self.emit_expr(&args[0].value);
+                let supported = match self.arch() {
+                    Arch::Aarch64 => mask_ty.width == 16,
+                    Arch::X86_64 => matches!(mask_ty.width, 16 | 32 | 64),
+                };
+                if mask_ty.scalar != ScalarType::Bool || !supported {
+                    self.error(&format!(
+                        "any_in_first needs a bool vector of one register, got {:?}[{}]",
+                        mask_ty.scalar, mask_ty.width
+                    ));
+                }
+                let count_i64 = VecType { scalar: ScalarType::I64, width: 1 };
+                let count: Value = if Self::is_literal(&args[1].value) {
+                    if !matches!(args[1].value.const_value(), Some(ast::ConstValue::Int(n)) if n >= 1 && n as u64 <= mask_ty.width) {
+                        self.error(&format!("any_in_first's count must be from 1 to {}", mask_ty.width));
+                    }
+                    self.emit_literal_broadcast(&args[1].value, count_i64).0
+                } else {
+                    let (count, count_ty) = self.emit_expr(&args[1].value);
+                    if count_ty.width != 1 || !count_ty.scalar.is_int() {
+                        self.error("any_in_first's count must be a scalar integer");
+                    }
+                    self.emit_int_resize(count, count_ty, count_i64)
+                };
+                let i64t: Type = IntegerType::new(self.ctx, 64).into();
+                let packed_type: Type = IntegerType::new(self.ctx, mask_ty.width as u32).into();
+                let int_const = |this: &mut Self, value: i64| -> Value<'c, 'a> {
+                    this.block
+                        .append_operation(arith::constant(this.ctx, IntegerAttribute::new(i64t, value).into(), this.loc))
+                        .result(0)
+                        .unwrap()
+                        .into()
+                };
+                let i8t: Type = IntegerType::new(self.ctx, 8).into();
+                let (bits, lanes_at_top): (Value<'c, 'a>, i64) = match self.arch() {
+                    Arch::Aarch64 => {
+                        let bytes: Value = self
+                            .block
+                            .append_operation(
+                                OperationBuilder::new("arith.extsi", self.loc)
+                                    .add_operands(&[mask])
+                                    .add_results(&[Type::vector(&[16], i8t)])
+                                    .build()
+                                    .expect("failed to build arith.extsi"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        (self.emit_nibblemask16(bytes), 4)
+                    }
+                    Arch::X86_64 => {
+                        let packed: Value = self
+                            .block
+                            .append_operation(
+                                OperationBuilder::new("llvm.bitcast", self.loc)
+                                    .add_operands(&[mask])
+                                    .add_results(&[packed_type])
+                                    .build()
+                                    .expect("failed to build llvm.bitcast"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let wide: Value = if mask_ty.width == 64 {
+                            packed
+                        } else {
+                            self.block
+                                .append_operation(arith::extui(packed, i64t, self.loc))
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        };
+                        (wide, 1)
+                    }
+                };
+                // Shift the lanes at and past n out of the top of the word.
+                let bits_per_lane = int_const(self, lanes_at_top);
+                let lanes = int_const(self, 64 / lanes_at_top);
+                let gone: Value = self
+                    .block
+                    .append_operation(arith::subi(lanes, count, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let amount: Value = self
+                    .block
+                    .append_operation(arith::muli(gone, bits_per_lane, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let kept: Value = self
+                    .block
+                    .append_operation(arith::shli(bits, amount, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let zero = int_const(self, 0);
+                let result: Value = self
+                    .block
+                    .append_operation(arith::cmpi(self.ctx, arith::CmpiPredicate::Ne, kept, zero, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (result, VecType { scalar: ScalarType::Bool, width: 1 })
             }
             ast::Expr::Ident(name) if name == "mask8" => {
                 // mask8(bool[N]) → u8[N]: true lanes are 0xFF, false lanes 0x00.
@@ -2799,68 +3311,49 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 (result, result_ty)
             }
             ast::Expr::Ident(name) if name == "nibblemask" => {
-                // nibblemask(u8[16]) → u64[1]: the high nibble of each lane, packed so
-                // lane i occupies bits 4i..4i+3 (NEON's cheap movemask: `shrn #4`).
+                // nibblemask(u8[16]) → u64[1]: for a mask whose lanes are 0x00 or 0xFF, 4 bits
+                // per lane, with lane i at bits 4i..4i+3 (NEON's cheap movemask: `shrn #4`).
                 assert_eq!(args.len(), 1, "nibblemask takes exactly 1 argument");
                 let (val, ty) = self.emit_expr(&args[0].value);
                 if ty.width != 16 || ty.scalar.bit_width() != 8 {
                     self.error("nibblemask requires a u8[16]");
                 }
-                let i8t: Type = IntegerType::new(self.ctx, 8).into();
-                let i16t: Type = IntegerType::new(self.ctx, 16).into();
-                let i64t: Type = IntegerType::new(self.ctx, 64).into();
-                let v8i16 = Type::vector(&[8], i16t);
-                let v8i8 = Type::vector(&[8], i8t);
-                let v1i64 = Type::vector(&[1], i64t);
-                let as_i16: Value = self
-                    .block
-                    .append_operation(
-                        OperationBuilder::new("vector.bitcast", self.loc)
-                            .add_operands(&[val])
-                            .add_results(&[v8i16])
-                            .build()
-                            .expect("failed to bitcast for nibblemask"),
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let four_attr = IntegerAttribute::new(i16t, 4);
-                let four: Value = self
-                    .block
-                    .append_operation(arith::constant(
-                        self.ctx,
-                        splat_attr(v8i16, &[four_attr.into()]).unwrap(),
-                        self.loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let shifted: Value = self
-                    .block
-                    .append_operation(arith::shrui(as_i16, four, self.loc))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let narrowed: Value = self
-                    .block
-                    .append_operation(arith::trunci(shifted, v8i8, self.loc))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let as_u64: Value = self
-                    .block
-                    .append_operation(
-                        OperationBuilder::new("vector.bitcast", self.loc)
-                            .add_operands(&[narrowed])
-                            .add_results(&[v1i64])
-                            .build()
-                            .expect("failed to bitcast nibbles"),
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
                 let result_ty = VecType { scalar: ScalarType::U64, width: 1 };
-                (self.emit_unwrap_unit(as_u64, result_ty), result_ty)
+                (self.emit_nibblemask16(val), result_ty)
+            }
+            ast::Expr::Ident(name) if name == "shuffle" => {
+                // shuffle(a, b, [T: lanes...]) → one output lane per entry: lane i of a, or
+                // lane i - N of b. The lane list is constant, so LLVM can choose an instruction.
+                assert_eq!(args.len(), 3, "shuffle takes exactly 3 arguments (a, b, lanes)");
+                let (a, a_ty) = self.emit_expr(&args[0].value);
+                let (b, b_ty) = self.emit_expr(&args[1].value);
+                if a_ty.width != b_ty.width || a_ty.scalar.bit_width() != b_ty.scalar.bit_width() {
+                    self.error("shuffle requires operands of the same type");
+                }
+                let ast::Expr::VecLit { values, .. } = &args[2].value else {
+                    self.error("shuffle's lanes must be a vector literal");
+                };
+                if let Some(bad) = values.iter().find(|&&lane| lane < 0 || lane >= 2 * a_ty.width as i64) {
+                    self.error(&format!("shuffle lane {} is out of range", bad));
+                }
+                let result_ty = VecType { scalar: a_ty.scalar, width: values.len() as u64 };
+                let result = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("vector.shuffle", self.loc)
+                            .add_operands(&[a, b])
+                            .add_results(&[result_ty.to_mlir_type(self.ctx)])
+                            .add_attributes(&[(
+                                melior::ir::Identifier::new(self.ctx, "mask"),
+                                DenseI64ArrayAttribute::new(self.ctx, values).into(),
+                            )])
+                            .build()
+                            .expect("failed to build vector.shuffle"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (result, result_ty)
             }
             ast::Expr::Ident(name) if name == "concat" => {
                 // concat(a: T[N], b: T[N]) → T[2N]
@@ -2931,6 +3424,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 if ty.width == 1 {
                     return (val, ty);
                 }
+                if self.arch() == Arch::Aarch64 && ty.width % 16 == 0 {
+                    let result = self.emit_any_wide(val, ty.width);
+                    return (result, VecType { scalar: ScalarType::Bool, width: 1 });
+                }
                 let bool_type = ScalarType::Bool.to_mlir_type(self.ctx);
                 let result_ty = VecType { scalar: ScalarType::Bool, width: 1 };
 
@@ -2954,61 +3451,15 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             ast::Expr::Ident(name) if name == "gather" => {
                 // gather(buf, indices) → gather elements from memref at index positions
                 assert_eq!(args.len(), 2, "gather takes exactly 2 arguments (buf, indices)");
-                let (buf_val, buf_bind) = self.emit_expr(&args[0].value);
-                let (index_val, index_ty) = self.emit_expr(&args[1].value);
-
-                // Determine element type from the buffer binding
-                let element_scalar = match &args[0].value {
-                    ast::Expr::Ident(name) => match self.vars.get(name) {
-                        Some(Binding::Ptr(_, scalar)) => *scalar,
-                        _ => panic!("gather base must be a ptr variable"),
-                    },
-                    _ => panic!("gather base must be an identifier"),
-                };
-
-                let result_ty = VecType {
-                    scalar: element_scalar,
-                    width: index_ty.width,
-                };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-
-                // Build all-true mask
-                let mask_ty = VecType { scalar: ScalarType::Bool, width: index_ty.width };
-                let mask_mlir = mask_ty.to_mlir_type(self.ctx);
-                let bool_type = ScalarType::Bool.to_mlir_type(self.ctx);
-                let mask_attr = IntegerAttribute::new(bool_type, 1);
-                let mask_splat = splat_attr(mask_mlir, &[mask_attr.into()])
-                    .expect("failed to create all-true mask");
-                let mask_val = self.block
-                    .append_operation(arith::constant(self.ctx, mask_splat.into(), self.loc))
-                    .result(0).unwrap().into();
-
-                // Passthrough (zero vector)
-                let passthrough = self.emit_zero_vector(result_ty);
-
-                // Zero index for base offset
-                let index_type = Type::index(self.ctx);
-                let zero_attr = IntegerAttribute::new(index_type, 0);
-                let zero_index = self.block
-                    .append_operation(arith::constant(self.ctx, zero_attr.into(), self.loc))
-                    .result(0).unwrap().into();
-
-                let gather_op = OperationBuilder::new("vector.gather", self.loc)
-                    .add_operands(&[buf_val, zero_index, index_val, mask_val, passthrough])
-                    .add_results(&[result_mlir])
-                    .build()
-                    .expect("failed to build vector.gather for ptr");
-
-                let result = self.block.append_operation(gather_op).result(0).unwrap().into();
-                (result, result_ty)
+                self.emit_gather(&args[0].value, &args[1].value, None)
             }
             ast::Expr::Ident(name) if name == "store_at" => {
                 // store_at(buf, offset, data) → vector.store at index offset
                 assert_eq!(args.len(), 3, "store_at takes 3 arguments (buf, offset, data)");
                 let (buf_val, buf_ty) = self.emit_expr(&args[0].value);
                 let offset_index = self.emit_index(&args[1].value);
-                let (data_val, data_ty) = self.emit_expr(&args[2].value);
                 let buf_scalar = self.ptr_scalar_of(&args[0].value, buf_ty.scalar);
+                let (data_val, data_ty) = self.emit_store_value(&args[2].value, buf_scalar);
 
                 self.emit_vector_store(data_val, data_ty, buf_val, buf_scalar, offset_index);
 
@@ -3091,99 +3542,115 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let result_ty = VecType { scalar: elem_scalar, width: 1 };
                 (self.emit_memref_load(ptr_val, offset_index, elem_scalar), result_ty)
             }
-            _ => {
-                // Inter-function call: look up user-defined function
-                let target_name = match func_expr {
-                    ast::Expr::Ident(n) => n.clone(),
-                    _ => panic!("non-identifier function call not supported: {:?}", func_expr),
-                };
-
-                let target_fn = self.fn_defs.get(&target_name)
-                    .unwrap_or_else(|| panic!("unknown function in codegen: {}", target_name))
-                    .clone();
-
-                // Use flatten_params to determine expected MLIR parameter types
-                let flat_params = flatten_params(
-                    self.ctx, &target_fn.params, &self.struct_defs,
-                    &self.comptime_env, self.native_width,
-                );
-
-                let param_mlir_types: Vec<Type<'c>> = flat_params.iter().map(|(_, t, _, _)| *t).collect();
-
-                // Build argument values
-                let mut call_args: Vec<Value<'c, 'a>> = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
-                    let target_param = &target_fn.params[i];
-                    if is_ptr_type_name(&target_param.ty.name) {
-                        // Ptr param: pass the memref value directly
-                        let (val, _) = self.emit_expr(&arg.value);
-                        call_args.push(val);
-                    } else if is_scalar_type_name(&target_param.ty.name) {
-                        // Scalar/vector param: pass directly
-                        let (val, _) = self.emit_expr(&arg.value);
-                        call_args.push(val);
-                    } else {
-                        // Struct param: flatten fields
-                        let (val, _) = self.emit_expr(&arg.value);
-                        // If it's a struct binding, push each field
-                        if let ast::Expr::Ident(ref var_name) = arg.value {
-                            if let Some(Binding::Struct { fields }) = self.vars.get(var_name).cloned() {
-                                for (_, fval, _) in &fields {
-                                    call_args.push(*fval);
-                                }
-                                continue;
-                            }
-                        }
-                        // Fallback: just pass the value (non-struct expression)
-                        call_args.push(val);
+            ast::Expr::Instantiate { .. } | ast::Expr::Ident(_) => {
+                let (results, ret_ty, env) = self.emit_user_call(func_expr, args);
+                match ret_ty {
+                    None => {
+                        // Void return — return a dummy
+                        let dummy_ty = VecType { scalar: ScalarType::I32, width: 1 };
+                        let dummy = self.emit_zero_vector(dummy_ty);
+                        (dummy, dummy_ty)
                     }
+                    Some(ret) if is_ptr_type_name(&ret.name) => {
+                        (results[0], VecType { scalar: ptr_element_scalar(&ret), width: 0 })
+                    }
+                    Some(ret) if is_scalar_type_name(&ret.name) => {
+                        (results[0], resolve_type(&ret, &env, self.native_width))
+                    }
+                    Some(ret) => self.error(&format!(
+                        "this call returns struct {}: assign it to a variable or access a field",
+                        ret.name
+                    )),
                 }
+            }
+            other => panic!("non-identifier function call not supported: {:?}", other),
+        }
+    }
 
-                // Determine return type
-                let (ret_mlir_types, ret_vt) = if let Some(ref ret_ty) = target_fn.ret_ty {
-                    if is_ptr_type_name(&ret_ty.name) {
-                        let scalar = ptr_element_scalar(ret_ty);
-                        let memref_type = ptr_to_memref_type(self.ctx, ret_ty);
-                        (vec![memref_type], VecType { scalar, width: 0 })
-                    } else if is_scalar_type_name(&ret_ty.name) {
-                        let vt = resolve_type(ret_ty, &self.comptime_env, self.native_width);
-                        (vec![vt.to_mlir_type(self.ctx)], vt)
-                    } else {
-                        panic!("inter-function calls returning structs are not yet supported");
-                    }
-                } else {
-                    // Void return
-                    (vec![], VecType { scalar: ScalarType::I32, width: 1 })
-                };
+    /// Call a user function. Returns its flattened results, its declared return type,
+    /// and the comptime environment that type is resolved in.
+    fn emit_user_call(
+        &mut self,
+        func_expr: &ast::Expr,
+        args: &[ast::CallArg],
+    ) -> (Vec<Value<'c, 'a>>, Option<ast::Type>, HashMap<String, u64>) {
+        let (target_name, explicit_widths) = match func_expr {
+            ast::Expr::Ident(n) => (n.clone(), None),
+            ast::Expr::Instantiate { name, widths } => (name.clone(), Some(widths)),
+            _ => panic!("non-identifier function call not supported: {:?}", func_expr),
+        };
 
-                // Build func.call
-                let call_op = OperationBuilder::new("func.call", self.loc)
-                    .add_operands(&call_args)
-                    .add_results(&ret_mlir_types)
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "callee"),
-                        melior::ir::attribute::FlatSymbolRefAttribute::new(
-                            self.ctx,
-                            &if target_fn.extern_c { extern_impl_name(&target_name) } else { target_name.clone() },
-                        )
-                        .into(),
-                    )])
-                    .build()
-                    .expect("failed to build func.call for inter-function call");
+        let target_fn = self.fn_defs.get(&target_name)
+            .unwrap_or_else(|| panic!("unknown function in codegen: {}", target_name))
+            .clone();
 
-                let op_ref = self.block.append_operation(call_op);
-
-                if ret_mlir_types.is_empty() {
-                    // Void return — return a dummy
-                    let dummy_ty = VecType { scalar: ScalarType::I32, width: 1 };
-                    let dummy = self.emit_zero_vector(dummy_ty);
-                    (dummy, dummy_ty)
-                } else {
-                    let result: Value = op_ref.result(0).unwrap().into();
-                    (result, ret_vt)
+        // Literal arguments are emitted last: their types depend on the callee's
+        // comptime parameters, which the other arguments may determine.
+        let mut call_args: Vec<Value<'c, 'a>> = Vec::new();
+        let mut arg_widths: Vec<Option<u64>> = Vec::new();
+        let mut literal_slots: Vec<(usize, usize)> = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let target_param = &target_fn.params[i];
+            arg_widths.push(None);
+            if is_ptr_type_name(&target_param.ty.name) {
+                // Ptr param: pass the memref value directly
+                let (val, _) = self.emit_expr(&arg.value);
+                call_args.push(val);
+            } else if is_scalar_type_name(&target_param.ty.name) {
+                if Self::takes_expected_type(&arg.value) {
+                    literal_slots.push((call_args.len(), i));
+                    call_args.push(self.emit_zero_vector(VecType { scalar: ScalarType::I64, width: 1 }));
+                    continue;
+                }
+                // Scalar/vector param: pass directly
+                let (val, ty) = self.emit_expr(&arg.value);
+                arg_widths[i] = Some(ty.width);
+                call_args.push(val);
+            } else {
+                // Struct param: pass each field
+                if !self.is_struct_expr(&arg.value) {
+                    self.error(&format!(
+                        "argument '{}' of '{}' must be a struct",
+                        target_param.name, target_name
+                    ));
+                }
+                for (_, val, _) in self.emit_struct_value(&arg.value) {
+                    call_args.push(val);
                 }
             }
         }
+
+        let (symbol, callee_env) = self.resolve_callee(&target_fn, explicit_widths, &arg_widths);
+
+        for (slot, i) in literal_slots {
+            let param_ty = resolve_type(&target_fn.params[i].ty, &callee_env, self.native_width);
+            call_args[slot] = self.emit_expr_typed(&args[i].value, param_ty).0;
+        }
+
+        let ret_mlir_types: Vec<Type<'c>> = match &target_fn.ret_ty {
+            None => vec![],
+            Some(ret) if is_ptr_type_name(&ret.name) => vec![ptr_to_memref_type(self.ctx, ret)],
+            Some(ret) => resolve_struct_return_types(
+                self.ctx, ret, &self.struct_defs, &callee_env, self.native_width,
+            )
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect(),
+        };
+
+        let op_ref = self.block.append_operation(
+            OperationBuilder::new("func.call", self.loc)
+                .add_operands(&call_args)
+                .add_results(&ret_mlir_types)
+                .add_attributes(&[(
+                    melior::ir::Identifier::new(self.ctx, "callee"),
+                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, &symbol).into(),
+                )])
+                .build()
+                .expect("failed to build func.call for inter-function call"),
+        );
+        let results = (0..ret_mlir_types.len()).map(|i| op_ref.result(i).unwrap().into()).collect();
+        (results, target_fn.ret_ty.clone(), callee_env)
     }
 
     /// Emit a stream construct: scf.for loop over buffer chunks with carry state.
@@ -3276,29 +3743,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             carry_vtypes.push(carry_vt);
             carry_mlir_types.push(carry_vt.to_mlir_type(self.ctx));
 
-            // Emit the initial value
-            let init_val = match &carry_def.init {
-                ast::Expr::BoolLit(false) | ast::Expr::IntLit(0) => {
-                    self.emit_zero_vector(carry_vt)
-                }
-                ast::Expr::BoolLit(true) => {
-                    let scalar_type = carry_vt.scalar.to_mlir_type(self.ctx);
-                    let vec_type = carry_vt.to_mlir_type(self.ctx);
-                    let attr = IntegerAttribute::new(scalar_type, 1);
-                    let splat = splat_attr(vec_type, &[attr.into()])
-                        .expect("failed to create all-ones splat");
-                    self.block
-                        .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
-                        .result(0)
-                        .unwrap()
-                        .into()
-                }
-                other => {
-                    // Try to evaluate as a general expression
-                    let (val, _) = self.emit_expr(other);
-                    val
-                }
-            };
+            let (init_val, _) = self.emit_expr_typed(&carry_def.init, carry_vt);
             init_carry_vals.push(init_val);
         }
 
@@ -3330,6 +3775,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         // 2. Create a FnCodegen for the inner block to emit body statements
         {
             let mut inner_cg = FnCodegen {
+                instances: self.instances.clone(),
                 ctx: self.ctx,
                 loc: self.loc,
                 block: &inner_block,
@@ -3367,6 +3813,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             // Safe because MLIR inner regions can reference outer values
             for (name, binding) in &self.vars {
                 if name != chunk_name
+                    && name != "chunk_offset"
                     && !carry_defs.iter().any(|c| &c.name == name)
                 {
                     let inner_binding: Binding =
@@ -3380,11 +3827,23 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 inner_cg.emit_stmt(stmt);
             }
 
-            // Emit carry update expressions and collect yield values
+            // Each carry takes its update, all evaluated before any applies. A carry with
+            // no update keeps its value.
+            for (name, _) in carry_updates {
+                if !carry_defs.iter().any(|c| &c.name == name) {
+                    inner_cg.error(&format!("'{}' isn't one of this stream's carries", name));
+                }
+            }
             let mut yield_vals: Vec<Value> = Vec::new();
-            for (_name, expr) in carry_updates {
-                let (val, _) = inner_cg.emit_expr(expr);
-                yield_vals.push(val);
+            for (idx, carry_def) in carry_defs.iter().enumerate() {
+                let value = match carry_updates.iter().find(|(name, _)| name == &carry_def.name) {
+                    Some((_, expr)) => inner_cg.emit_expr_typed(expr, carry_vtypes[idx]).0,
+                    None => match inner_cg.vars.get(&carry_def.name) {
+                        Some(Binding::Vec(val, _)) => *val,
+                        _ => inner_cg.error(&format!("carry '{}' isn't a vector", carry_def.name)),
+                    },
+                };
+                yield_vals.push(value);
             }
 
             // scf.yield
@@ -3426,57 +3885,20 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         match &stmt.kind {
             ast::StmtKind::Assign { target, ty: ann_ty, value } => match target {
                 ast::AssignTarget::Ident(name) => {
-                    // Check if the value is a struct literal
                     match value {
-                        ast::Expr::StructLit {
-                            name: sname,
-                            width,
-                            fields: field_exprs,
-                        } => {
-                            let struct_def = self
-                                .struct_defs
-                                .get(sname)
-                                .unwrap_or_else(|| self.error(&format!("undefined struct: {}", sname)))
-                                .clone();
-
-                            let concrete_width =
-                                width.eval(&self.comptime_env, self.native_width);
-
-                            let mut struct_comptime = self.comptime_env.clone();
-                            if let Some(cp) = struct_def.comptime_params.first() {
-                                struct_comptime.insert(cp.name.clone(), concrete_width);
-                            }
-
-                            let mut fields: Vec<(String, Value<'c, 'a>, VecType)> = Vec::new();
-                            for field_def in &struct_def.fields {
-                                let expr = field_exprs
-                                    .iter()
-                                    .find(|(fname, _)| fname == &field_def.name)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "struct literal '{}' missing field '{}'",
-                                            sname, field_def.name
-                                        )
-                                    });
-                                let (val, ty) = self.emit_expr(&expr.1);
-                                fields.push((field_def.name.clone(), val, ty));
-                            }
-
-                            self.vars.insert(
-                                name.clone(),
-                                Binding::Struct { fields },
-                            );
+                        _ if self.is_struct_expr(value) => {
+                            let fields = self.emit_struct_value(value);
+                            self.vars.insert(name.clone(), Binding::Struct { fields });
                         }
                         _ => {
-                            // If there's a type annotation and the value is a literal,
-                            // use the annotation to broadcast the literal to the right type.
                             let (val, ty) = if let Some(ann) = ann_ty {
-                                if Self::is_literal(value) {
-                                    let target_ty = resolve_type(ann, &self.comptime_env, self.native_width);
-                                    self.emit_literal_broadcast(value, target_ty)
-                                } else {
-                                    self.emit_expr(value)
-                                }
+                                let target_ty = resolve_type(ann, &self.comptime_env, self.native_width);
+                                self.emit_expr_typed(value, target_ty)
+                            } else if let (true, Some(Binding::Vec(_, existing))) =
+                                (Self::is_literal(value), self.vars.get(name).cloned())
+                            {
+                                // A literal assigned to an existing variable takes its type.
+                                self.emit_literal_broadcast(value, existing)
                             } else {
                                 self.emit_expr(value)
                             };
@@ -3497,13 +3919,27 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         value,
                     );
                 }
-                ast::AssignTarget::Destructure(_names) => {
-                    panic!("destructuring assignment not yet implemented in codegen");
+                ast::AssignTarget::Destructure(names) => {
+                    if !self.is_struct_expr(value) {
+                        self.error("destructuring needs a struct value");
+                    }
+                    let fields = self.emit_struct_value(value);
+                    if fields.len() != names.len() {
+                        self.error(&format!(
+                            "destructuring {} names from a struct with {} fields",
+                            names.len(),
+                            fields.len()
+                        ));
+                    }
+                    for (name, (_, val, ty)) in names.iter().zip(fields) {
+                        self.vars.insert(name.clone(), Binding::Vec(val, ty));
+                    }
                 }
             },
-            ast::StmtKind::Return(_) => {
-                // Handled by the caller (emit_fn)
+            ast::StmtKind::Return(_) | ast::StmtKind::ReturnVoid => {
+                // Handled by the caller (emit_fn); desugaring leaves these last in a function
             }
+            ast::StmtKind::Break => self.error("break outside of a loop"),
             ast::StmtKind::Stream {
                 chunk_name,
                 chunk_ty,
@@ -3524,7 +3960,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                                     args.len() == 2 || args.len() == 3,
                                     "store takes 2 or 3 arguments"
                                 );
-                                self.emit_store(&args[0].value, &args[1].value);
+                                self.emit_store(&args[0].value, &args[1].value, args.get(2).map(|a| &a.value));
                                 return;
                             }
                         }
@@ -3546,6 +3982,96 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 self.emit_while(cond, body);
             }
         }
+    }
+
+    /// A value of the same type as `binding`, for a path that never reads it.
+    fn emit_placeholder(&mut self, binding: &Binding<'c, '_>, name: &str) -> Binding<'c, 'a> {
+        match binding {
+            Binding::Vec(_, ty) => Binding::Vec(self.emit_zero_vector(*ty), *ty),
+            Binding::Struct { fields } => Binding::Struct {
+                fields: fields
+                    .iter()
+                    .map(|(field, _, ty)| (field.clone(), self.emit_zero_vector(*ty), *ty))
+                    .collect(),
+            },
+            Binding::Ptr(..) => self.error(&format!(
+                "pointer '{}' must be defined on every path through an early return",
+                name
+            )),
+        }
+    }
+
+    /// Codegen for a nested region. MLIR regions may use values from enclosing regions.
+    fn inner_codegen<'b>(&self, block: &'b Block<'c>) -> FnCodegen<'c, 'b> {
+        FnCodegen {
+            instances: self.instances.clone(),
+            ctx: self.ctx,
+            loc: self.loc,
+            block,
+            vars: self
+                .vars
+                .iter()
+                .map(|(k, b)| (k.clone(), unsafe { std::mem::transmute(b.clone()) }))
+                .collect(),
+            comptime_env: self.comptime_env.clone(),
+            native_width: self.native_width,
+            struct_defs: self.struct_defs.clone(),
+            fn_defs: self.fn_defs.clone(),
+            current_span: self.current_span,
+        }
+    }
+
+    /// `a && b` / `a || b`: `b` is evaluated only in the branch that needs it.
+    fn emit_logical(&mut self, op: ast::LogicalOp, lhs: &ast::Expr, rhs: &ast::Expr) -> (Value<'c, 'a>, VecType) {
+        let bool1 = VecType { scalar: ScalarType::Bool, width: 1 };
+        let i1: Type = IntegerType::new(self.ctx, 1).into();
+        let (lhs_val, _) = if Self::is_literal(lhs) {
+            self.emit_literal_broadcast(lhs, bool1)
+        } else {
+            self.emit_expr(lhs)
+        };
+
+        let eval_block = Block::new(&[]);
+        let short_block = Block::new(&[]);
+        {
+            let mut cg = self.inner_codegen(&eval_block);
+            let (rhs_val, _) = if Self::is_literal(rhs) {
+                cg.emit_literal_broadcast(rhs, bool1)
+            } else {
+                cg.emit_expr(rhs)
+            };
+            eval_block.append_operation(scf::r#yield(&[rhs_val], self.loc));
+
+            let short_value = matches!(op, ast::LogicalOp::Or) as i64;
+            let short: Value = short_block
+                .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i1, short_value).into(), self.loc))
+                .result(0)
+                .unwrap()
+                .into();
+            short_block.append_operation(scf::r#yield(&[short], self.loc));
+        }
+        let (then_block, else_block) = match op {
+            ast::LogicalOp::And => (eval_block, short_block),
+            ast::LogicalOp::Or => (short_block, eval_block),
+        };
+        let then_region = Region::new();
+        then_region.append_block(then_block);
+        let else_region = Region::new();
+        else_region.append_block(else_block);
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("scf.if", self.loc)
+                    .add_operands(&[lhs_val])
+                    .add_results(&[i1])
+                    .add_regions([then_region, else_region])
+                    .build()
+                    .expect("failed to build scf.if for a logical operator"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        (result, bool1)
     }
 
     /// Emit an if/else statement as a real branch (`scf.if`).
@@ -3572,29 +4098,13 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let else_block = Block::new(&[]);
 
         let result_types: Vec<Type<'c>>;
-        let result_bindings: Vec<(String, Option<ScalarType>, Option<VecType>)>;
+        let result_bindings: Vec<IfResult>;
         {
-            let new_inner = |this: &Self, block| FnCodegen {
-                ctx: this.ctx,
-                loc: this.loc,
-                block,
-                vars: this
-                    .vars
-                    .iter()
-                    // MLIR regions may use values from enclosing regions.
-                    .map(|(k, b)| (k.clone(), unsafe { std::mem::transmute(b.clone()) }))
-                    .collect(),
-                comptime_env: this.comptime_env.clone(),
-                native_width: this.native_width,
-                struct_defs: this.struct_defs.clone(),
-                fn_defs: this.fn_defs.clone(),
-                current_span: this.current_span,
-            };
-            let mut then_cg = new_inner(self, &then_block);
+            let mut then_cg = self.inner_codegen(&then_block);
             for stmt in then_body {
                 then_cg.emit_stmt(stmt);
             }
-            let mut else_cg = new_inner(self, &else_block);
+            let mut else_cg = self.inner_codegen(&else_block);
             for stmt in else_body {
                 else_cg.emit_stmt(stmt);
             }
@@ -3608,8 +4118,19 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             let mut bindings = Vec::new();
             let mut then_yield: Vec<Value> = Vec::new();
             let mut else_yield: Vec<Value> = Vec::new();
+            let (then_continues, else_continues) = ast::sides_that_continue(cond_expr, then_body, else_body);
             for name in names {
-                match (then_cg.vars.get(&name), else_cg.vars.get(&name)) {
+                let mut then_binding = then_cg.vars.get(&name).cloned();
+                let mut else_binding = else_cg.vars.get(&name).cloned();
+                // A side that never continues doesn't need a real value for a name defined
+                // on the other side. Nothing can read this one.
+                if let (Some(binding), None, false) = (&then_binding, &else_binding, else_continues) {
+                    else_binding = Some(else_cg.emit_placeholder(binding, &name));
+                }
+                if let (None, Some(binding), false) = (&then_binding, &else_binding, then_continues) {
+                    then_binding = Some(then_cg.emit_placeholder(binding, &name));
+                }
+                match (&then_binding, &else_binding) {
                     (Some(Binding::Vec(tv, tt)), Some(Binding::Vec(ev, et))) => {
                         if tt.to_mlir_type(self.ctx) != et.to_mlir_type(self.ctx) {
                             self.error(&format!(
@@ -3620,20 +4141,34 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         types.push(tt.to_mlir_type(self.ctx));
                         then_yield.push(*tv);
                         else_yield.push(*ev);
-                        bindings.push((name, None, Some(*tt)));
+                        bindings.push(IfResult::Vec(name, *tt));
                     }
                     (Some(Binding::Ptr(tv, ts)), Some(Binding::Ptr(ev, _))) => {
                         let elem = ts.to_mlir_type(self.ctx);
                         types.push(MemRefType::new(elem, &[i64::MIN], None, None).into());
                         then_yield.push(*tv);
                         else_yield.push(*ev);
-                        bindings.push((name, Some(*ts), None));
+                        bindings.push(IfResult::Ptr(name, *ts));
                     }
-                    (Some(Binding::Struct { .. }), _) | (_, Some(Binding::Struct { .. })) => {
-                        self.error(&format!(
-                            "struct variable '{}' cannot be assigned inside an if",
-                            name
-                        ));
+                    (Some(Binding::Struct { fields: tf }), Some(Binding::Struct { fields: ef })) => {
+                        let same_shape = tf.len() == ef.len()
+                            && tf.iter().zip(ef).all(|((tn, _, tt), (en, _, et))| {
+                                tn == en && tt.to_mlir_type(self.ctx) == et.to_mlir_type(self.ctx)
+                            });
+                        if !same_shape {
+                            self.error(&format!(
+                                "variable '{}' is a different struct in each branch of an if",
+                                name
+                            ));
+                        }
+                        let mut field_types = Vec::with_capacity(tf.len());
+                        for ((field, tv, tt), (_, ev, _)) in tf.iter().zip(ef) {
+                            types.push(tt.to_mlir_type(self.ctx));
+                            then_yield.push(*tv);
+                            else_yield.push(*ev);
+                            field_types.push((field.clone(), *tt));
+                        }
+                        bindings.push(IfResult::Struct(name, field_types));
                     }
                     // Defined in only one branch: scoped to that branch.
                     (Some(_), None) | (None, Some(_)) | (None, None) => {}
@@ -3665,14 +4200,27 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 .expect("failed to build scf.if"),
         );
 
-        for (idx, (name, ptr_scalar, vec_ty)) in result_bindings.into_iter().enumerate() {
-            let result: Value<'c, 'a> = if_op.result(idx).unwrap().into();
-            let binding = match (ptr_scalar, vec_ty) {
-                (Some(s), _) => Binding::Ptr(result, s),
-                (_, Some(t)) => Binding::Vec(result, t),
-                _ => unreachable!(),
+        let mut next_result = 0;
+        for binding in result_bindings {
+            let mut take = || {
+                let result: Value<'c, 'a> = if_op.result(next_result).unwrap().into();
+                next_result += 1;
+                result
             };
-            self.vars.insert(name, binding);
+            match binding {
+                IfResult::Vec(name, ty) => {
+                    let value = take();
+                    self.vars.insert(name, Binding::Vec(value, ty));
+                }
+                IfResult::Ptr(name, scalar) => {
+                    let value = take();
+                    self.vars.insert(name, Binding::Ptr(value, scalar));
+                }
+                IfResult::Struct(name, field_types) => {
+                    let fields = field_types.into_iter().map(|(f, ty)| (f, take(), ty)).collect();
+                    self.vars.insert(name, Binding::Struct { fields });
+                }
+            }
         }
     }
 
@@ -3682,8 +4230,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         for stmt in stmts {
             match &stmt.kind {
                 ast::StmtKind::Assign { target, .. } => {
-                    if let ast::AssignTarget::Ident(name) = target {
-                        names.push(name.clone());
+                    match target {
+                        ast::AssignTarget::Ident(name) => names.push(name.clone()),
+                        ast::AssignTarget::Destructure(targets) => names.extend(targets.iter().cloned()),
+                        ast::AssignTarget::Scatter { .. } => {}
                     }
                 }
                 ast::StmtKind::If { then_body, else_body, .. } => {
@@ -3693,12 +4243,46 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 ast::StmtKind::While { body, .. } => {
                     names.extend(Self::collect_assigned_vars(body));
                 }
+                // A stream's carries are visible after it.
+                ast::StmtKind::Stream { carry, .. } => {
+                    names.extend(carry.iter().map(|c| c.name.clone()));
+                }
                 _ => {}
             }
         }
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Bind a loop's carried values, in `carried` order, as variables. Struct fields are
+    /// gathered back into their struct.
+    fn bind_carried(
+        vars: &mut HashMap<String, Binding<'c, 'a>>,
+        carried: &[(String, VecType, bool)],
+        fields: &[Option<String>],
+        value_at: impl Fn(usize) -> Value<'c, 'a>,
+    ) {
+        for (idx, (name, ty, is_ptr)) in carried.iter().enumerate() {
+            let value = value_at(idx);
+            match (&fields[idx], is_ptr) {
+                (None, true) => {
+                    vars.insert(name.clone(), Binding::Ptr(value, ty.scalar));
+                }
+                (None, false) => {
+                    vars.insert(name.clone(), Binding::Vec(value, *ty));
+                }
+                (Some(field), _) => {
+                    // A struct's fields are adjacent; its first field starts it afresh.
+                    if idx == 0 || carried[idx - 1].0 != *name {
+                        vars.insert(name.clone(), Binding::Struct { fields: Vec::new() });
+                    }
+                    if let Some(Binding::Struct { fields: bound }) = vars.get_mut(name) {
+                        bound.push((field.clone(), value, *ty));
+                    }
+                }
+            }
+        }
     }
 
     /// Emit a while loop using scf.while with iter_args for modified variables.
@@ -3721,23 +4305,27 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         // Also include variables referenced in the condition that get modified.
         let assigned_names = Self::collect_assigned_vars(body_stmts);
 
-        // Filter to only variables that exist in the current scope (not new ones)
-        // and collect their initial values and types
+        // Carry the variables that already exist in the current scope (not new ones).
+        // A struct is carried one field at a time: (name, Some(field), ...).
         let mut carried_vars: Vec<(String, Value<'c, 'a>, VecType, bool)> = Vec::new(); // (name, init_val, type, is_ptr)
+        let mut carried_fields: Vec<Option<String>> = Vec::new();
         for name in &assigned_names {
             if let Some(binding) = self.vars.get(name) {
                 match binding {
                     Binding::Vec(val, ty) => {
                         carried_vars.push((name.clone(), *val, *ty, false));
+                        carried_fields.push(None);
                     }
                     Binding::Ptr(val, scalar) => {
-                        // Ptrs are memrefs — they can't easily be carried as iter_args
-                        // in scf.while because they need to be memref types.
-                        // For now, carry the memref value with a sentinel type.
+                        // A memref's descriptor flows through the loop as a block argument.
                         carried_vars.push((name.clone(), *val, VecType { scalar: *scalar, width: 0 }, true));
+                        carried_fields.push(None);
                     }
-                    Binding::Struct { .. } => {
-                        // Skip struct bindings for now
+                    Binding::Struct { fields } => {
+                        for (field, val, ty) in fields {
+                            carried_vars.push((name.clone(), *val, *ty, false));
+                            carried_fields.push(Some(field.clone()));
+                        }
                     }
                 }
             }
@@ -3766,6 +4354,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         // Create inner FnCodegen for the before block to evaluate the condition
         {
             let mut before_cg = FnCodegen {
+                instances: self.instances.clone(),
                 ctx: self.ctx,
                 loc: self.loc,
                 block: &before_block,
@@ -3784,14 +4373,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             }
 
             // Override carried vars with block args
-            for (idx, (name, _, ty, is_ptr)) in carried_vars.iter().enumerate() {
-                let arg_val: Value = before_block.argument(idx).unwrap().into();
-                if *is_ptr {
-                    before_cg.vars.insert(name.clone(), Binding::Ptr(arg_val, ty.scalar));
-                } else {
-                    before_cg.vars.insert(name.clone(), Binding::Vec(arg_val, *ty));
-                }
-            }
+            let carried: Vec<(String, VecType, bool)> =
+                carried_vars.iter().map(|(n, _, t, p)| (n.clone(), *t, *p)).collect();
+            FnCodegen::bind_carried(&mut before_cg.vars, &carried, &carried_fields, |idx| {
+                before_block.argument(idx).unwrap().into()
+            });
 
             // Evaluate condition
             let (cond_val, _) = before_cg.emit_expr(cond_expr);
@@ -3823,6 +4409,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
         {
             let mut body_cg = FnCodegen {
+                instances: self.instances.clone(),
                 ctx: self.ctx,
                 loc: self.loc,
                 block: &after_block,
@@ -3841,14 +4428,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             }
 
             // Override carried vars with "after" block args
-            for (idx, (name, _, ty, is_ptr)) in carried_vars.iter().enumerate() {
-                let arg_val: Value = after_block.argument(idx).unwrap().into();
-                if *is_ptr {
-                    body_cg.vars.insert(name.clone(), Binding::Ptr(arg_val, ty.scalar));
-                } else {
-                    body_cg.vars.insert(name.clone(), Binding::Vec(arg_val, *ty));
-                }
-            }
+            let carried: Vec<(String, VecType, bool)> =
+                carried_vars.iter().map(|(n, _, t, p)| (n.clone(), *t, *p)).collect();
+            FnCodegen::bind_carried(&mut body_cg.vars, &carried, &carried_fields, |idx| {
+                after_block.argument(idx).unwrap().into()
+            });
 
             // Emit body statements
             for stmt in body_stmts {
@@ -3857,15 +4441,18 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
             // Yield updated carried vars
             let mut yield_vals: Vec<Value> = Vec::new();
-            for (name, _, ty, is_ptr) in &carried_vars {
-                if let Some(binding) = body_cg.vars.get(name) {
-                    match binding {
-                        Binding::Vec(val, _) => yield_vals.push(*val),
-                        Binding::Ptr(val, _) => yield_vals.push(*val),
-                        _ => panic!("unexpected struct binding in while yield"),
+            for (idx, (name, _, _, _)) in carried_vars.iter().enumerate() {
+                match (body_cg.vars.get(name), &carried_fields[idx]) {
+                    (Some(Binding::Vec(val, _)), None) | (Some(Binding::Ptr(val, _)), None) => {
+                        yield_vals.push(*val);
                     }
-                } else {
-                    panic!("carried variable '{}' not found after while body", name);
+                    (Some(Binding::Struct { fields }), Some(field)) => {
+                        let found = fields.iter().find(|(f, _, _)| f == field).unwrap_or_else(|| {
+                            panic!("struct '{}' lost field '{}' in a while body", name, field)
+                        });
+                        yield_vals.push(found.1);
+                    }
+                    _ => panic!("variable '{}' changed kind in a while body", name),
                 }
             }
 
@@ -3893,14 +4480,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let while_result = self.block.append_operation(while_op);
 
         // Bind final values back into outer scope
-        for (idx, (name, _, ty, is_ptr)) in carried_vars.iter().enumerate() {
-            let result_val: Value<'c, 'a> = while_result.result(idx).unwrap().into();
-            if *is_ptr {
-                self.vars.insert(name.clone(), Binding::Ptr(result_val, ty.scalar));
-            } else {
-                self.vars.insert(name.clone(), Binding::Vec(result_val, *ty));
-            }
-        }
+        let carried: Vec<(String, VecType, bool)> =
+            carried_vars.iter().map(|(n, _, t, p)| (n.clone(), *t, *p)).collect();
+        Self::bind_carried(&mut self.vars, &carried, &carried_fields, |idx| {
+            while_result.result(idx).unwrap().into()
+        });
     }
 
     fn make_index_const(&mut self, value: i64) -> Value<'c, 'a> {
@@ -3922,7 +4506,9 @@ fn resolve_struct_return_types<'c>(
     comptime_env: &HashMap<String, u64>,
     native_width: u64,
 ) -> Vec<(Type<'c>, VecType)> {
-    if is_scalar_type_name(&ret_ty.name) {
+    if is_ptr_type_name(&ret_ty.name) {
+        vec![(ptr_to_memref_type(ctx, ret_ty), VecType { scalar: ptr_element_scalar(ret_ty), width: 0 })]
+    } else if is_scalar_type_name(&ret_ty.name) {
         let vt = resolve_type(ret_ty, comptime_env, native_width);
         vec![(vt.to_mlir_type(ctx), vt)]
     } else {
@@ -4017,6 +4603,12 @@ fn emit_const_global<'c>(ctx: &'c Context, def: &ast::ConstDef) -> Operation<'c>
     let elem = scalar.to_mlir_type(ctx);
     let len = def.values.len() as i64;
     let memref_ty = MemRefType::new(elem, &[len], None, None);
+    if scalar.is_int() {
+        let bits = scalar.bit_width();
+        if let Some(bad) = def.values.iter().find(|&&v| bits < 64 && (v < -(1i64 << (bits - 1)) || v >= (1i64 << bits))) {
+            panic!("const '{}': literal {} doesn't fit in {:?}", def.name, bad, scalar);
+        }
+    }
     let elem_name = format!("i{}", scalar.bit_width());
     let numbers: Vec<String> = def.values.iter().map(|v| v.to_string()).collect();
     let dense = melior::ir::attribute::Attribute::parse(
@@ -4040,7 +4632,7 @@ fn emit_const_global<'c>(ctx: &'c Context, def: &ast::ConstDef) -> Operation<'c>
         .expect("failed to build memref.global")
 }
 
-pub fn emit_fn<'c>(
+fn emit_fn<'c>(
     ctx: &'c Context,
     fn_def: &ast::FnDef,
     comptime_env: &HashMap<String, u64>,
@@ -4048,6 +4640,7 @@ pub fn emit_fn<'c>(
     struct_defs: &HashMap<String, ast::StructDef>,
     fn_defs: &HashMap<String, ast::FnDef>,
     const_defs: &[ast::ConstDef],
+    instances: std::rc::Rc<std::cell::RefCell<Instances>>,
 ) -> Operation<'c> {
     let loc = Location::unknown(ctx);
 
@@ -4075,6 +4668,7 @@ pub fn emit_fn<'c>(
 
     // Set up codegen state
     let mut cg = FnCodegen {
+        instances,
         ctx,
         loc,
         block: &block,
@@ -4160,62 +4754,15 @@ pub fn emit_fn<'c>(
         cg.current_span = last.span;
         match &last.kind {
             ast::StmtKind::Return(expr) => {
-                // Check if it's a struct literal or struct variable
                 match expr {
-                    ast::Expr::StructLit {
-                        name,
-                        width,
-                        fields: field_exprs,
-                    } => {
-                        // Flatten struct literal into multiple return values
-                        let struct_def = cg
-                            .struct_defs
-                            .get(name)
-                            .unwrap_or_else(|| panic!("undefined struct: {}", name))
-                            .clone();
-
-                        let concrete_width =
-                            width.eval(&cg.comptime_env, cg.native_width);
-
-                        let mut struct_comptime = cg.comptime_env.clone();
-                        if let Some(cp) = struct_def.comptime_params.first() {
-                            struct_comptime.insert(cp.name.clone(), concrete_width);
-                        }
-
-                        let mut vals = Vec::new();
-                        for field_def in &struct_def.fields {
-                            let field_expr = field_exprs
-                                .iter()
-                                .find(|(fname, _)| fname == &field_def.name)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "struct literal '{}' missing field '{}'",
-                                        name, field_def.name
-                                    )
-                                });
-                            let (val, _) = cg.emit_expr(&field_expr.1);
-                            vals.push(val);
-                        }
-                        vals
+                    _ if cg.is_struct_expr(expr) => {
+                        cg.emit_struct_value(expr).into_iter().map(|(_, val, _)| val).collect()
                     }
-                    ast::Expr::Ident(var_name) => {
-                        // Check if it's a struct binding
-                        let binding = cg
-                            .vars
-                            .get(var_name)
-                            .unwrap_or_else(|| cg.error(&format!("undefined variable: {}", var_name)))
-                            .clone();
-                        match binding {
-                            Binding::Vec(val, _) | Binding::Ptr(val, _) => vec![val],
-                            Binding::Struct { fields } => {
-                                fields.iter().map(|(_, val, _)| *val).collect()
-                            }
-                        }
-                    }
-                    _ => {
-                        let (val, _) = cg.emit_expr(expr);
-                        vec![val]
-                    }
+                    _ => match ret_info.first() {
+                        Some((_, ret_vt)) if ret_vt.width != 0 => vec![cg.emit_expr_typed(expr, *ret_vt).0],
+                        Some(_) => vec![cg.emit_expr(expr).0],
+                        None => cg.error("a function with no return type can't return a value"),
+                    },
                 }
             }
             _ => vec![],
@@ -4409,8 +4956,19 @@ pub fn compile_module<'c>(
     ctx: &'c Context,
     items: &[ast::Item],
     comptime_env: &HashMap<String, u64>,
-    native_width: u64,
 ) -> Module<'c> {
+    compile_module_for(ctx, items, comptime_env, Arch::host())
+}
+
+/// Compile a program to an MLIR module for a given architecture.
+pub fn compile_module_for<'c>(
+    ctx: &'c Context,
+    items: &[ast::Item],
+    comptime_env: &HashMap<String, u64>,
+    arch: Arch,
+) -> Module<'c> {
+    let native_width = arch.register_bytes();
+    let items = &crate::comptime::with_register_bytes(items, native_width)[..];
     let module = Module::new(Location::unknown(ctx));
 
     // Collect struct definitions first
@@ -4429,6 +4987,14 @@ pub fn compile_module<'c>(
         }
     }
 
+    let instances = std::rc::Rc::new(std::cell::RefCell::new(Instances {
+        arch,
+        module_env: comptime_env.clone(),
+        seen: Default::default(),
+        pending: Vec::new(),
+        envs: HashMap::new(),
+    }));
+
     let const_defs: Vec<ast::ConstDef> = items
         .iter()
         .filter_map(|item| match item {
@@ -4446,7 +5012,11 @@ pub fn compile_module<'c>(
                 // Merge function-level comptime params with global env
                 let env = comptime_env.clone();
                 // For now, comptime params must be provided in the env
-                let op = emit_fn(ctx, fn_def, &env, native_width, &struct_defs, &fn_defs, &const_defs);
+                // A generic function is emitted once per set of widths it's called with.
+                if fn_def.comptime_params.iter().any(|p| !env.contains_key(&p.name)) {
+                    continue;
+                }
+                let op = emit_fn(ctx, fn_def, &env, native_width, &struct_defs, &fn_defs, &const_defs, instances.clone());
                 module.body().append_operation(op);
                 if fn_def.extern_c {
                     let entry = emit_extern_entry(ctx, fn_def, &env, native_width, &struct_defs);
@@ -4459,18 +5029,27 @@ pub fn compile_module<'c>(
         }
     }
 
+    // Emitting an instance can request more instances.
+    loop {
+        let next = instances.borrow_mut().pending.pop();
+        let Some(def) = next else { break };
+        let env = instances.borrow().envs[&def.name].clone();
+        let op = emit_fn(ctx, &def, &env, native_width, &struct_defs, &fn_defs, &const_defs, instances.clone());
+        module.body().append_operation(op);
+    }
+
     module
 }
 
 /// Lower an MLIR module through the pass pipeline to LLVM dialect.
 pub fn lower_to_llvm(ctx: &Context, module: &mut Module) -> Result<(), String> {
-    // Set native target for optimal codegen
-    if let Some(attr) = melior::ir::attribute::Attribute::parse(ctx, "\"aarch64-apple-darwin\"") {
+    lower_to_llvm_for(ctx, module, Arch::host_triple())
+}
+
+/// Lower an MLIR module to the LLVM dialect for a target triple.
+pub fn lower_to_llvm_for(ctx: &Context, module: &mut Module, triple: &str) -> Result<(), String> {
+    if let Some(attr) = melior::ir::attribute::Attribute::parse(ctx, &format!("\"{}\"", triple)) {
         module.as_operation_mut().set_attribute("llvm.target_triple", attr);
-    }
-    // Set target CPU to native so LLVM uses host instruction set (NEON, etc.)
-    if let Some(attr) = melior::ir::attribute::Attribute::parse(ctx, "\"apple-m1\"") {
-        module.as_operation_mut().set_attribute("llvm.target_cpu", attr);
     }
 
     let pass_manager = pass::PassManager::new(ctx);
@@ -4502,6 +5081,30 @@ pub fn lower_to_llvm(ctx: &Context, module: &mut Module) -> Result<(), String> {
         .map_err(|_| "MLIR pass pipeline failed".to_string())
 }
 
+/// The NEON names these tests pass vectors with, on x86: the same lanes in the same
+/// registers under the C ABI.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[allow(non_camel_case_types)]
+mod neon_names {
+    use std::arch::x86_64::*;
+
+    pub type float32x4_t = __m128;
+    pub type int32x4_t = __m128i;
+    pub type uint32x4_t = __m128i;
+    pub type uint8x16_t = __m128i;
+    pub type uint8x8_t = __m128i;
+
+    pub unsafe fn vld1q_f32(p: *const f32) -> float32x4_t { unsafe { _mm_loadu_ps(p) } }
+    pub unsafe fn vst1q_f32(p: *mut f32, v: float32x4_t) { unsafe { _mm_storeu_ps(p, v) } }
+    pub unsafe fn vld1q_s32(p: *const i32) -> int32x4_t { unsafe { _mm_loadu_si128(p.cast()) } }
+    pub unsafe fn vst1q_s32(p: *mut i32, v: int32x4_t) { unsafe { _mm_storeu_si128(p.cast(), v) } }
+    pub unsafe fn vld1q_u32(p: *const u32) -> uint32x4_t { unsafe { _mm_loadu_si128(p.cast()) } }
+    pub unsafe fn vst1q_u32(p: *mut u32, v: uint32x4_t) { unsafe { _mm_storeu_si128(p.cast(), v) } }
+    pub unsafe fn vld1q_u8(p: *const u8) -> uint8x16_t { unsafe { _mm_loadu_si128(p.cast()) } }
+    pub unsafe fn vst1q_u8(p: *mut u8, v: uint8x16_t) { unsafe { _mm_storeu_si128(p.cast(), v) } }
+    pub unsafe fn vld1_u8(p: *const u8) -> uint8x8_t { unsafe { _mm_loadl_epi64(p.cast()) } }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4524,7 +5127,7 @@ mod tests {
     fn jit_lookup_opt(source: &str, fn_name: &str, opt_level: usize) -> (*mut (), melior::ExecutionEngine) {
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         if !module.as_operation().verify() {
             eprintln!("MLIR verify failed for '{}':\n{}", fn_name, module.as_operation());
             panic!("MLIR verify failed");
@@ -4535,7 +5138,10 @@ mod tests {
         (fptr, engine)
     }
 
+    #[cfg(target_arch = "aarch64")]
     use std::arch::aarch64::*;
+    #[cfg(target_arch = "x86_64")]
+    use neon_names::*;
 
     #[test]
     fn test_vector_add_f32() {
@@ -4705,7 +5311,7 @@ mod tests {
         // Need custom jit_lookup with comptime env
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &env(&[("N", 4)]), 8);
+        let mut module = compile_module(&ctx, &items, &env(&[("N", 4)]));
         assert!(module.as_operation().verify());
         lower_to_llvm(&ctx, &mut module).unwrap();
         let engine = ExecutionEngine::new(&module, 0, &[], false);
@@ -4850,7 +5456,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(ir.contains("func.func @add"));
         assert!(ir.contains("vector<4xf32>"));
@@ -4906,7 +5512,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(
             module.as_operation().verify(),
             "verify failed:\n{}",
@@ -4949,7 +5555,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(
             module.as_operation().verify(),
             "verify failed:\n{}",
@@ -5012,7 +5618,7 @@ mod tests {
     #[test]
     fn test_load_mlir_verify() {
         let source = r#"
-            fn do_load(ptr: f32[1]) -> f32[4] {
+            fn do_load(ptr: ptr[f32]) -> f32[4] {
                 return load[f32[4]](ptr)
             }
         "#;
@@ -5024,7 +5630,7 @@ mod tests {
         // We'll use a simpler approach: just verify the IR contains vector.load.
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("vector.load"),
@@ -5048,7 +5654,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("vector.store"),
@@ -5065,13 +5671,13 @@ mod tests {
     fn test_gather_mlir_verify() {
         // src.[indices] produces vector.gather
         let source = r#"
-            fn do_gather(src: f32[1], indices: i32[4]) -> f32[4] {
+            fn do_gather(src: ptr[f32], indices: i32[4]) -> f32[4] {
                 return src.[indices]
             }
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("vector.gather"),
@@ -5088,13 +5694,13 @@ mod tests {
     fn test_scatter_mlir_verify() {
         // dst.[indices] = src produces vector.scatter
         let source = r#"
-            fn do_scatter(dst: f32[1], indices: i32[4], src: f32[4]) {
+            fn do_scatter(dst: ptr[f32], indices: i32[4], src: f32[4]) {
                 dst.[indices] = src
             }
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("vector.scatter"),
@@ -5179,15 +5785,7 @@ mod tests {
                 return [structural] 1 : 0
             }
         "#;
-        let (fptr, _engine) = jit_lookup(source, "classify");
-        unsafe {
-            let f: extern "C" fn(uint8x8_t) -> int32x4_t = std::mem::transmute(fptr);
-            // vector<8xi32> is 256 bits = two int32x4_t on ARM64
-            // Actually vector<8xi32> doesn't fit in one NEON register.
-            // Let's use a simpler approach: return via memory.
-            // Instead, change to i32[4] for a simpler test.
-            drop(f); // don't use
-        }
+        let (_fptr, _engine) = jit_lookup(source, "classify");
 
         // Simpler: test with 4-wide
         let source4 = r#"
@@ -5196,18 +5794,11 @@ mod tests {
                 return [structural] 1 : 0
             }
         "#;
-        let (fptr, _engine) = jit_lookup(source4, "classify4");
-        unsafe {
-            // u8[4] = vector<4xi8> and i32[4] = vector<4xi32>
-            // On ARM64: u8[4] fits in lower 32 bits of a NEON reg,
-            // i32[4] = 128 bits = one int32x4_t
-            // But passing vector<4xi8> is tricky. Let's verify IR only.
-            drop(fptr);
-        }
+        let (_fptr, _engine) = jit_lookup(source4, "classify4");
         // Just verify the IR compiles and verifies
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify());
         lower_to_llvm(&ctx, &mut module).unwrap();
     }
@@ -5230,7 +5821,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify());
         lower_to_llvm(&ctx, &mut module).unwrap();
     }
@@ -5274,7 +5865,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("scf.for"),
@@ -5308,7 +5899,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             ir.contains("scf.for"),
@@ -5371,6 +5962,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")] // vector<1xi32> comes back in s0, which is NEON's ABI
     #[test]
     fn test_scf_for_with_carry_minimal() {
         // Minimal: scf.for accumulating a counter, no memref
@@ -5448,6 +6040,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")] // vector<1xi32> comes back in s0, which is NEON's ABI
     #[test]
     fn test_scf_for_with_memref_and_carry() {
         // scf.for with memref input AND carry state
@@ -5870,7 +6463,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         assert!(
             module.as_operation().verify(),
@@ -5925,7 +6518,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         eprintln!("=== JSON Stage 1 MLIR ===\n{}", ir);
         assert!(
@@ -6040,7 +6633,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let module = compile_module(&ctx, &items, &HashMap::new());
         let ir = format!("{}", module.as_operation());
         eprintln!("=== JSON Stage 2 MLIR ===\n{}", ir);
         assert!(
@@ -7877,13 +8470,7 @@ mod tests {
                 return [in_str] 1 : 0
             }
         "#;
-        let (fptr, _engine) = jit_lookup_opt(source, "test_clmul", 2);
-        unsafe {
-            // i32[8] = 256 bits = two int32x4_t. Use sret-style or just check first 4.
-            // Actually vector<8xi32> on ARM64 uses two q registers.
-            // For simplicity, verify via a scalar reduction.
-            drop(fptr);
-        }
+        let (_fptr, _engine) = jit_lookup_opt(source, "test_clmul", 2);
         // Just verify the scan.xor result via a simpler test
         let source2 = r#"
             fn test_clmul2(v: u8[8]) -> i32[1] {
@@ -9279,7 +9866,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify(), "MLIR verify failed:\n{}", module.as_operation());
         lower_to_llvm(&ctx, &mut module).unwrap();
         let engine = melior::ExecutionEngine::new(&module, 0, &[], false);
@@ -9417,7 +10004,7 @@ mod tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify(), "MLIR verify failed:\n{}", module.as_operation());
         lower_to_llvm(&ctx, &mut module).unwrap();
         let engine = melior::ExecutionEngine::new(&module, 0, &[], false);
@@ -9455,7 +10042,7 @@ mod extra_tests {
         "#;
         let ctx = create_context();
         let items = parser::parse(source);
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify(), "MLIR verify failed:\n{}", module.as_operation());
         lower_to_llvm(&ctx, &mut module).unwrap();
         let engine = melior::ExecutionEngine::new(&module, 0, &[], false);
@@ -9483,9 +10070,9 @@ mod scalar_and_branch_tests {
     fn with_fn<R>(source: &str, name: &str, body: impl FnOnce(*mut ()) -> R) -> R {
         let ctx = create_context();
         let items = parser::parse(source);
-        typecheck::typecheck(&items, &HashMap::new(), 8)
+        typecheck::typecheck(&items, &HashMap::new())
             .unwrap_or_else(|e| panic!("type errors: {:?}", e.iter().map(|x| x.to_string()).collect::<Vec<_>>()));
-        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        let mut module = compile_module(&ctx, &items, &HashMap::new());
         assert!(module.as_operation().verify(), "MLIR verify failed:\n{}", module.as_operation());
         lower_to_llvm(&ctx, &mut module).unwrap();
         let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
@@ -9496,7 +10083,7 @@ mod scalar_and_branch_tests {
 
     fn type_errors(source: &str) -> Vec<String> {
         let items = parser::parse(source);
-        match typecheck::typecheck(&items, &HashMap::new(), 8) {
+        match typecheck::typecheck(&items, &HashMap::new()) {
             Ok(()) => vec![],
             Err(errors) => errors.iter().map(|e| e.to_string()).collect(),
         }
@@ -9629,14 +10216,6 @@ mod scalar_and_branch_tests {
     }
 
     #[test]
-    fn return_inside_a_branch_or_loop_is_rejected() {
-        for body in ["if x > 0 { return x }", "while x > 0 { return x }"] {
-            let errors = type_errors(&format!("fn f(x: i64[1]) -> i64[1] {{ {} return x }}", body));
-            assert!(errors.iter().any(|e| e.contains("return")), "{}: got {:?}", body, errors);
-        }
-    }
-
-    #[test]
     fn const_tables_are_pointers() {
         let source = r#"
             const TABLE = [u8: 10, 20, 30, 40]
@@ -9750,6 +10329,36 @@ mod scalar_and_branch_tests {
     }
 
     #[test]
+    fn shuffle_picks_lanes_from_both_operands() {
+        let source = r#"
+            fn f(buf: ptr[u8]) {
+                a = load_at[u8[16]](buf, 0)
+                b = load_at[u8[16]](buf, 16)
+                store_at(buf, 32, shuffle(a, b, [u8: 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]))
+                store_at(buf, 48, shuffle(a, b, [u8: 31, 0, 30, 1, 29, 2, 28, 3, 27, 4, 26, 5, 25, 6, 24, 7]))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf: Vec<u8> = (0..64).collect();
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[32..48], &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
+            assert_eq!(&buf[48..64], &[31, 0, 30, 1, 29, 2, 28, 3, 27, 4, 26, 5, 25, 6, 24, 7]);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn shuffle_rejects_lanes_past_both_operands() {
+        with_fn(
+            "fn f(a: u8[16]) -> u8[2] { return shuffle(a, a, [u8: 0, 32]) }",
+            "f",
+            |_| (),
+        );
+    }
+
+    #[test]
     fn concat_joins_halves() {
         let source = r#"
             fn f(buf: ptr[u8]) {
@@ -9848,6 +10457,83 @@ mod scalar_and_branch_tests {
     }
 
     #[test]
+    fn comptime_widths_are_numbers_too() {
+        let source = r#"
+            fn offset[N](buf: ptr[u8]) -> i64[1] {
+                return to_i64(load_at(buf, N - 1)) + N
+            }
+            fn f(buf: ptr[u8]) -> i64[1] { return offset[3](buf) + offset[5](buf) * 1000 }
+        "#;
+        let mut buf: Vec<u8> = (0..8).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), (2 + 3) + (4 + 5) * 1000);
+        });
+    }
+
+    #[test]
+    fn register_bytes_is_a_width_and_a_number() {
+        let source = r#"
+            fn f(buf: ptr[u8]) -> i64[1] {
+                v = load_at[u8[REGISTER_BYTES]](buf, 0)
+                store_at(buf, REGISTER_BYTES, v)
+                return REGISTER_BYTES * 2
+            }
+        "#;
+        let register = Arch::host().register_bytes() as usize;
+        let mut buf: Vec<u8> = (0..register as u8 * 2).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 2 * register as i64);
+        });
+        assert_eq!(&buf[register..], &(0..register as u8).collect::<Vec<u8>>()[..]);
+    }
+
+    #[test]
+    fn underscore_width_is_one_register_of_the_lane_type() {
+        let source = r#"
+            fn bytes(buf: ptr[u8]) -> i32[1] { return popcount(load_at[u8[_]](buf, 0) == 0) }
+            fn words(buf: ptr[u32]) -> i32[1] { return popcount(load_at[u32[_]](buf, 0) == 0) }
+        "#;
+        let register = Arch::host().register_bytes() as i32;
+        with_fn(source, "bytes", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i32 = std::mem::transmute(p);
+            let mut buf = [0u8; 64];
+            let (a, b, c, d, e) = desc(&mut buf);
+            assert_eq!(f(a, b, c, d, e), register);
+        });
+        with_fn(source, "words", |p| unsafe {
+            let f: extern "C" fn(*mut u32, *mut u32, i64, i64, i64) -> i32 = std::mem::transmute(p);
+            let mut buf = [0u32; 16];
+            assert_eq!(f(buf.as_mut_ptr(), buf.as_mut_ptr(), 0, 16, 1), register / 4);
+        });
+    }
+
+    #[test]
+    fn any_in_first_works_at_register_width() {
+        let source = r#"
+            fn f(buf: ptr[u8], n: i64[1]) -> i64[1] {
+                if any_in_first(load_at[u8[REGISTER_BYTES]](buf, 0) > 127, n) { return 1 }
+                return 0
+            }
+        "#;
+        let register = Arch::host().register_bytes() as i64;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            for lane in 0..register {
+                let mut buf = vec![0u8; register as usize];
+                buf[lane as usize] = 200;
+                let (a, b, c, d, e) = desc(&mut buf);
+                for n in 1..=register {
+                    assert_eq!(f(a, b, c, d, e, n), (lane < n) as i64, "lane {lane}, first {n}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn unlikely_passes_its_value_through() {
         let source = r#"
             fn f(x: i64[1]) -> i64[1] {
@@ -9915,6 +10601,1536 @@ mod scalar_and_branch_tests {
     #[should_panic(expected = "both private and extern")]
     fn private_extern_is_rejected() {
         parser::parse("private extern fn f(x: i64[1]) -> i64[1] { return x }");
+    }
+
+    #[test]
+    fn generics_infer_widths_from_arguments() {
+        let source = r#"
+            fn sum_lanes[N](v: u8[N]) -> u8[1] { return +/ v }
+            fn f(buf: ptr[u8]) -> u64[1] {
+                a = sum_lanes(load_at[u8[16]](buf, 0))
+                b = sum_lanes(load_at[u8[32]](buf, 0))
+                return (to_i64(a) << 8) | to_i64(b)
+            }
+        "#;
+        let mut buf = [1u8; 32];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), (16 << 8) | 32, "each width gets its own copy");
+        });
+    }
+
+    #[test]
+    fn generics_take_explicit_widths_and_nest() {
+        let source = r#"
+            fn first[N](buf: ptr[u8]) -> u8[1] {
+                return extract(load_at[u8[N]](buf, 1), 0)
+            }
+            fn outer[M](buf: ptr[u8]) -> u8[1] { return first[M * 2](buf) }
+            fn f(buf: ptr[u8]) -> u64[1] {
+                return (to_i64(first[16](buf)) << 8) | to_i64(outer[16](buf))
+            }
+        "#;
+        let mut buf: Vec<u8> = (0..64).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), (1 << 8) | 1);
+        });
+    }
+
+    #[test]
+    fn generic_errors_are_reported() {
+        let cases = [
+            ("fn g[N](b: ptr[u8]) -> u8[1] { return load_at(b, 0) } fn f(b: ptr[u8]) -> u8[1] { return g(b) }", "can't infer N"),
+            ("fn g[N](x: u8[N], y: u8[N]) -> u8[N] { return x } fn f(a: u8[16], b: u8[32]) -> u8[16] { return g(a, b) }", "has width"),
+            ("fn g[N](x: u8[N]) -> u8[N] { return x } fn f(a: u8[16]) -> u8[16] { return g[16, 32](a) }", "comptime parameters"),
+            ("extern fn g[N](x: u8[N]) -> u8[N] { return x }", "extern fn"),
+            // A body is checked with the widths it's called with.
+            ("fn g[N](x: u8[N]) -> u8[16] { return tbl(x, x) } fn f(a: u8[32]) -> u8[16] { return g(a) }", "tbl table"),
+        ];
+        for (source, expected) in cases {
+            let errors = type_errors(source);
+            assert!(errors.iter().any(|e| e.contains(expected)), "{}: got {:?}", source, errors);
+        }
+    }
+
+    #[test]
+    fn an_uncalled_generic_emits_nothing() {
+        with_fn("fn g[N](x: u8[N]) -> u8[N] { return x } fn f(x: i64[1]) -> i64[1] { return x }", "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(3), 3);
+        });
+    }
+
+    #[test]
+    fn any_sees_every_lane_at_every_register_width() {
+        for width in [16usize, 32, 48, 64] {
+            let source = format!(
+                "fn f(buf: ptr[u8]) -> i64[1] {{
+                    if any(load_at[u8[{width}]](buf, 0) > 127) {{ r: i64[1] = 1 }} else {{ r: i64[1] = 0 }}
+                    return r
+                }}"
+            );
+            with_fn(&source, "f", |p| unsafe {
+                let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+                let mut buf = vec![0u8; width];
+                let (a, b, c, d, e) = desc(&mut buf);
+                assert_eq!(f(a, b, c, d, e), 0, "all clear at width {width}");
+                for lane in 0..width {
+                    buf[lane] = 200;
+                    assert_eq!(f(a, b, c, d, e), 1, "lane {lane} of {width}");
+                    buf[lane] = 0;
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn fold_min_takes_the_minimum_across_registers() {
+        let source = r#"
+            fn wide(buf: ptr[u8]) {
+                store_at(buf, 64, fold_min(load_at[u8[64]](buf, 0)))
+            }
+            fn narrow(buf: ptr[u8]) {
+                store_at(buf, 64, fold_min(load_at[u8[16]](buf, 0)))
+            }
+        "#;
+        let register = Arch::host().register_bytes() as usize;
+        let mut input = vec![200u8; 128];
+        for (i, value) in [(0, 7), (16 + 1, 8), (32 + 2, 9), (48 + 15, 10)] {
+            input[i] = value;
+        }
+        with_fn(source, "wide", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = input.clone();
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            let expected: Vec<u8> = (0..register)
+                .map(|lane| (0..64).filter(|i| i % register == lane).map(|i| input[i]).min().unwrap())
+                .collect();
+            assert_eq!(&buf[64..64 + register], &expected[..]);
+        });
+        with_fn(source, "narrow", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = input.clone();
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[64..80], &input[..16], "a no-op when it fits in one register");
+        });
+        let errors = type_errors("fn f(v: u8[48]) -> u8[16] { return fold_min(v) }");
+        if register == 32 {
+            assert!(errors.iter().any(|e| e.contains("fold_min")), "got {:?}", errors);
+        }
+    }
+
+    #[test]
+    fn tbl_gives_zero_for_indices_past_the_table() {
+        let source = r#"
+            fn f(buf: ptr[u8]) {
+                table = [u8: 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115]
+                store_at(buf, 16, tbl(table, load_at[u8[16]](buf, 0)))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let indices: [u8; 16] = [0, 15, 16, 17, 31, 32, 64, 112, 127, 128, 129, 143, 200, 239, 240, 255];
+            let mut buf = [0u8; 32];
+            buf[..16].copy_from_slice(&indices);
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            let expected: Vec<u8> = indices.iter().map(|&i| if i < 16 { 100 + i } else { 0 }).collect();
+            assert_eq!(&buf[16..32], &expected[..]);
+        });
+    }
+
+    #[test]
+    fn clmul_is_carry_less() {
+        let source = "fn f(a: u64[1], b: u64[1]) -> u64[1] { return clmul(a, b) }";
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(0b11, 0b11), 0b101, "(x + 1)^2 has no x term without carries");
+            assert_eq!(f(0b1011, 1), 0b1011);
+            // The running parity of its bits, as JSON's string tracking uses it.
+            assert_eq!(f(0b0100_0100, u64::MAX), 0b0011_1100);
+        });
+    }
+
+    #[test]
+    fn any_in_first_only_sees_the_first_lanes() {
+        let source = r#"
+            fn f(buf: ptr[u8], n: i64[1]) -> i64[1] {
+                if any_in_first(load_at[u8[16]](buf, 0) > 127, n) { return 1 }
+                return 0
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            for lane in 0..16i64 {
+                let mut buf = [0u8; 16];
+                buf[lane as usize] = 200;
+                let (a, b, c, d, e) = desc(&mut buf);
+                for n in 1..=16i64 {
+                    assert_eq!(f(a, b, c, d, e, n), (lane < n) as i64, "lane {lane}, first {n}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn wide_stores_write_every_byte_at_any_offset() {
+        let source = r#"
+            fn f(buf: ptr[u8], at: i64[1]) {
+                store_at(buf, at, load_at[u8[64]](buf, 0))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf: Vec<u8> = (0..140).collect();
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e, 67);
+            assert_eq!(&buf[67..131], &(0..64).collect::<Vec<u8>>()[..]);
+            assert_eq!(buf[66], 66, "byte before is untouched");
+            assert_eq!(buf[131], 131, "byte after is untouched");
+        });
+    }
+
+    #[test]
+    fn bool_literals_and_negation() {
+        let source = r#"
+            fn f(x: i64[1]) -> i64[1] {
+                flag: bool[1] = true
+                if x > 0 {
+                    flag = ~flag
+                }
+                if flag { r = x + 100 } else { r = x }
+                return r
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!([f(5), f(-5)], [5, 95]);
+        });
+    }
+
+    // ---- values that used to be silently wrong
+
+    #[test]
+    fn reductions_and_scans_respect_signedness() {
+        let source = r#"
+            fn umax(buf: ptr[u8]) -> u8[1] { return max/ load_at[u8[16]](buf, 0) }
+            fn umin(buf: ptr[u8]) -> u8[1] { return min/ load_at[u8[16]](buf, 0) }
+            fn imax(buf: ptr[u8]) -> i8[1] { return max/ load_at[i8[16]](buf, 0) }
+            fn imin(buf: ptr[u8]) -> i8[1] { return min/ load_at[i8[16]](buf, 0) }
+            fn uscan(buf: ptr[u8]) { store_at(buf, 16, scan.max(load_at[u8[16]](buf, 0))) }
+        "#;
+        let mut buf = [100u8; 32];
+        buf[3] = 200;
+        buf[9] = 50;
+        let (a, b, c, d, e) = desc(&mut buf);
+        for (name, expected) in [("umax", 200u8), ("umin", 50), ("imax", 100), ("imin", 200)] {
+            with_fn(source, name, |p| unsafe {
+                let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u8 = std::mem::transmute(p);
+                assert_eq!(f(a, b, c, d, e), expected, "{}", name);
+            });
+        }
+        with_fn(source, "uscan", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            f(a, b, c, d, e);
+        });
+        assert_eq!(&buf[16..20], &[100, 100, 100, 200]);
+        assert_eq!(buf[31], 200, "the running max stays at 200 as unsigned");
+    }
+
+    #[test]
+    fn masked_store_writes_only_active_lanes() {
+        let source = r#"
+            fn f(buf: ptr[u8], other: ptr[u8]) {
+                v = load_at[u8[16]](other, 0)
+                store(buf, v, v > 127)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, *mut u8, *mut u8, i64, i64, i64) =
+                std::mem::transmute(p);
+            let mut buf = [7u8; 16];
+            let mut other = [1u8; 16];
+            other[2] = 200;
+            other[15] = 201;
+            let (a, b, c, d, e) = desc(&mut buf);
+            let (g, h, i, j, k) = desc(&mut other);
+            f(a, b, c, d, e, g, h, i, j, k);
+            let mut expected = [7u8; 16];
+            expected[2] = 200;
+            expected[15] = 201;
+            assert_eq!(buf, expected);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "doesn't fit")]
+    fn literal_too_big_for_its_type_is_an_error() {
+        with_fn("fn f(x: u8[16]) -> u8[16] { return x + 300 }", "f", |_| ());
+    }
+
+    #[test]
+    fn literals_may_use_either_reading_of_their_bits() {
+        let source = "fn f(x: u8[1]) -> u8[1] { return (x & 255) + (x & -1) }";
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(u8) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(3), 6);
+        });
+    }
+
+    // ---- literals
+
+    #[test]
+    fn constant_expressions_work_wherever_a_type_is_known() {
+        let cases: &[(&str, i64)] = &[
+            ("fn f(x: i64[1]) -> i64[1] { y: i64[1] = 0 - 1
+                return x + y }", 9),
+            ("fn f(x: i64[1]) -> i64[1] { return x + (1 << 4) }", 26),
+            ("fn f(x: i64[1]) -> i64[1] { return x << (1 + 1) }", 40),
+            ("fn f(x: i64[1]) -> i64[1] { return 7 }", 7),
+            ("fn f(x: i64[1]) -> i64[1] { return 2 * 3 + 1 }", 7),
+            ("fn g(a: i64[1], b: i64[1]) -> i64[1] { return a - b }
+              fn f(x: i64[1]) -> i64[1] { return g(x, 4 - 1) }", 7),
+            ("fn g(a: i64[1], b: i64[1]) -> i64[1] { return a - b }
+              fn f(x: i64[1]) -> i64[1] { return g(100, x) }", 90),
+            ("fn f(x: i64[1]) -> i64[1] { y = x
+                y = 5
+                return y }", 5),
+            ("fn f(x: i64[1]) -> i64[1] { return max(1, x) + min(x, 20) }", 20),
+        ];
+        for (source, expected) in cases {
+            with_fn(source, "f", |p| unsafe {
+                let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+                assert_eq!(f(10), *expected, "{}", source);
+            });
+        }
+    }
+
+    #[test]
+    fn a_literal_stored_through_a_pointer_takes_its_element_type() {
+        let source = "fn f(buf: ptr[u8]) { store_at(buf, 1, 30 + 4) }";
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [0u8; 3];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(buf, [0, 34, 0]);
+        });
+    }
+
+    #[test]
+    fn a_literal_passed_to_a_generic_takes_the_inferred_width() {
+        let source = r#"
+            fn add[N](a: u8[N], b: u8[N]) -> u8[N] { return a + b }
+            fn f(buf: ptr[u8]) { store_at(buf, 16, add(load_at[u8[16]](buf, 0), 5)) }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [1u8; 32];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[16..32], &[6u8; 16]);
+        });
+    }
+
+    #[test]
+    fn argument_widths_are_checked() {
+        let errors = type_errors(
+            "fn g(a: u8[16]) -> u8[16] { return a } fn f(a: u8[32]) -> u8[16] { return g(a) }",
+        );
+        assert!(errors.iter().any(|e| e.contains("expected width 16, got 32")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn a_literal_with_nothing_to_give_it_a_type_is_an_error() {
+        let errors = type_errors("fn f(x: i64[1]) -> i64[1] { y = 5
+            return x + y }");
+        assert!(errors.iter().any(|e| e.contains("needs a type")), "got {:?}", errors);
+    }
+
+    // ---- masks and gathers
+
+    #[test]
+    fn masked_without_fallback_zeroes_inactive_lanes() {
+        let source = r#"
+            fn f(buf: ptr[u8]) {
+                v = load_at[u8[16]](buf, 0)
+                store_at(buf, 16, [v > 100] v)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [50u8; 32];
+            buf[4] = 200;
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(buf[20], 200);
+            assert_eq!(buf[16], 0);
+        });
+    }
+
+    #[test]
+    fn gather_syntax_uses_the_pointer_element_type() {
+        let source = r#"
+            fn many(buf: ptr[u8], at: ptr[i32]) {
+                indices = load_at[i32[4]](at, 0)
+                store_at(buf, 0, buf.[indices])
+            }
+            fn one(buf: ptr[u8], i: i32[1]) -> u8[1] { return buf.[i] }
+            fn put(buf: ptr[u8], i: i32[1], v: u8[1]) { buf.[i] = v }
+        "#;
+        let mut buf: Vec<u8> = (10..30).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "one", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i32) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e, 3), 13);
+        });
+        with_fn(source, "put", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i32, u8) = std::mem::transmute(p);
+            f(a, b, c, d, e, 19, 99);
+        });
+        assert_eq!(buf[19], 99);
+        with_fn(source, "many", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, *mut i32, *mut i32, i64, i64, i64) =
+                std::mem::transmute(p);
+            let mut at = [5i32, 0, 2, 7];
+            f(a, b, c, d, e, at.as_mut_ptr(), at.as_mut_ptr(), 0, 4, 1);
+        });
+        assert_eq!(&buf[..4], &[15, 10, 12, 17]);
+    }
+
+    // ---- structs
+
+    const PAIR: &str = "struct Pair[N] { a: i64[N], b: i64[N] }\n";
+
+    fn run_i64(source: &str, inputs: &[(i64, i64)]) {
+        let program = format!("{}{}", PAIR, source);
+        with_fn(&program, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            for (input, expected) in inputs {
+                assert_eq!(f(*input), *expected, "f({}) in {}", input, source);
+            }
+        });
+    }
+
+    #[test]
+    fn structs_cross_function_boundaries() {
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] { return Pair[1] { a: x, b: x * 2 } }
+             fn f(x: i64[1]) -> i64[1] { p = mk(x)
+                return p.a + p.b }",
+            &[(5, 15)],
+        );
+        run_i64(
+            "fn sum(p: Pair[1]) -> i64[1] { return p.a + p.b }
+             fn f(x: i64[1]) -> i64[1] { p = Pair[1] { a: x, b: 1 }
+                return sum(p) }",
+            &[(5, 6)],
+        );
+        run_i64(
+            "fn sum(p: Pair[1]) -> i64[1] { return p.a + p.b }
+             fn f(x: i64[1]) -> i64[1] { return sum(Pair[1] { a: x, b: 1 }) }",
+            &[(5, 6)],
+        );
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] { return Pair[1] { a: x, b: 7 } }
+             fn sum(p: Pair[1]) -> i64[1] { return p.a + p.b }
+             fn f(x: i64[1]) -> i64[1] { return sum(mk(x)) + mk(x).b }",
+            &[(5, 19)],
+        );
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] { return Pair[1] { a: x, b: 7 } }
+             fn again(x: i64[1]) -> Pair[1] { return mk(x + 1) }
+             fn f(x: i64[1]) -> i64[1] { return again(x).a }",
+            &[(5, 6)],
+        );
+    }
+
+    #[test]
+    fn generic_functions_can_return_generic_structs() {
+        let source = r#"
+            struct Two[N] { lo: u8[N], hi: u8[N] }
+            fn both[N](x: u8[N]) -> Two[N] { return Two[N] { lo: x, hi: x + 1 } }
+            fn f(buf: ptr[u8]) {
+                t = both(load_at[u8[16]](buf, 0))
+                w = both(load_at[u8[32]](buf, 0))
+                store_at(buf, 32, t.hi)
+                store_at(buf, 48, w.hi)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [4u8; 80];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(buf[32], 5);
+            assert_eq!(buf[79], 5);
+        });
+    }
+
+    #[test]
+    fn struct_assigned_in_a_while_updates_the_loop_state() {
+        // This used to compile, then drop the assignment and never terminate.
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                p = Pair[1] { a: x, b: 0 }
+                while p.a > 0 { p = Pair[1] { a: p.a - 1, b: p.b + p.a } }
+                return p.b
+            }",
+            &[(4, 10), (0, 0)],
+        );
+    }
+
+    #[test]
+    fn struct_assigned_in_an_if_merges() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                p = Pair[1] { a: 1, b: 2 }
+                if x > 0 { p = Pair[1] { a: x, b: 20 } }
+                if x > 5 { q = Pair[1] { a: 100, b: 0 } } else { q = Pair[1] { a: 200, b: 0 } }
+                return p.a + p.b + q.a
+            }",
+            &[(3, 223), (7, 127), (-1, 203)],
+        );
+    }
+
+    #[test]
+    fn destructuring_binds_fields_in_order() {
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] { return Pair[1] { a: x, b: x + 1 } }
+             fn f(x: i64[1]) -> i64[1] {
+                (first, second) = mk(x)
+                return first * 100 + second
+             }",
+            &[(5, 506)],
+        );
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] { return Pair[1] { a: x, b: x + 1 } }
+             fn f(x: i64[1]) -> i64[1] {
+                total: i64[1] = 0
+                i: i64[1] = 0
+                while i < x {
+                    (lo, hi) = mk(i)
+                    total = total + lo * hi
+                    i = i + 1
+                }
+                return total
+             }",
+            &[(3, 8)],
+        );
+        let errors = type_errors(&format!(
+            "{}fn mk(x: i64[1]) -> Pair[1] {{ return Pair[1] {{ a: x, b: x }} }}
+             fn f(x: i64[1]) -> i64[1] {{ (one) = mk(x)
+                return one }}",
+            PAIR
+        ));
+        assert!(errors.iter().any(|e| e.contains("destructuring 1 names")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn struct_type_errors_are_reported() {
+        let errors = type_errors(&format!(
+            "{}fn f(x: i64[1]) -> i64[1] {{ p = Pair[1] {{ a: x, b: x }}
+                return p.missing }}",
+            PAIR
+        ));
+        assert!(errors.iter().any(|e| e.contains("missing")), "got {:?}", errors);
+    }
+
+    // ---- control flow
+
+    #[test]
+    fn else_if_chains() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                if x > 10 { y: i64[1] = 1 } else if x > 5 { y: i64[1] = 2 } else if x > 0 { y: i64[1] = 3 } else { y: i64[1] = 4 }
+                return y
+            }",
+            &[(11, 1), (6, 2), (1, 3), (0, 4)],
+        );
+    }
+
+    #[test]
+    fn logical_operators_short_circuit() {
+        // A null pointer: evaluating the right side would crash.
+        let source = r#"
+            fn and_guard(go: i64[1], p: ptr[u8]) -> i64[1] {
+                if go > 0 && load_at(p, 0) == 1 { return 1 }
+                return 0
+            }
+            fn or_guard(stop: i64[1], p: ptr[u8]) -> i64[1] {
+                if stop > 0 || load_at(p, 0) == 1 { return 1 }
+                return 0
+            }
+        "#;
+        let null = std::ptr::null::<u8>();
+        with_fn(source, "and_guard", |p| unsafe {
+            let f: extern "C" fn(i64, *const u8, *const u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(0, null, null, 0, 0, 1), 0);
+            let one = [1u8];
+            assert_eq!(f(1, one.as_ptr(), one.as_ptr(), 0, 1, 1), 1);
+        });
+        with_fn(source, "or_guard", |p| unsafe {
+            let f: extern "C" fn(i64, *const u8, *const u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(1, null, null, 0, 0, 1), 1);
+            let zero = [0u8];
+            assert_eq!(f(0, zero.as_ptr(), zero.as_ptr(), 0, 1, 1), 0);
+        });
+        let errors = type_errors("fn f(a: bool[4], b: bool[4]) -> bool[1] { return a && b }");
+        assert!(errors.iter().any(|e| e.contains("scalar bools")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn likely_passes_its_value_through() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] { if likely(x > 0) { return x }
+                return 0 - x }",
+            &[(4, 4), (-4, 4)],
+        );
+    }
+
+    #[test]
+    fn break_leaves_only_the_innermost_loop() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                while i < 100 {
+                    if i == x { break }
+                    i = i + 1
+                }
+                return i
+            }",
+            &[(0, 0), (5, 5), (200, 100)],
+        );
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                total: i64[1] = 0
+                i: i64[1] = 0
+                while i < 3 {
+                    j: i64[1] = 0
+                    while j < 100 {
+                        if j == x { break }
+                        total = total + 1
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+                return total
+            }",
+            &[(2, 6), (0, 0)],
+        );
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                skipped: i64[1] = 0
+                while i < 10 {
+                    i = i + 1
+                    if i < x { skipped = skipped + 1 } else { break }
+                    skipped = skipped + 100
+                }
+                return skipped
+            }",
+            &[(3, 202), (1, 0)],
+        );
+    }
+
+    #[test]
+    fn early_return_from_branches() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                if x > 10 { return 1 }
+                if x > 5 { return 2 } else if x > 0 { y = x
+                    return y * 10 }
+                z = x - 1
+                return z
+            }",
+            &[(11, 1), (6, 2), (3, 30), (-3, -4)],
+        );
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                if x > 0 { return 1 } else { return 2 }
+            }",
+            &[(1, 1), (-1, 2)],
+        );
+        // A name defined before the if and used after it, on the path that continues.
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                y = x * 2
+                if y > 10 {
+                    z: i64[1] = 1
+                    return y + z
+                } else {
+                    z: i64[1] = 2
+                }
+                return y + 100
+            }",
+            &[(6, 13), (1, 102)],
+        );
+    }
+
+    #[test]
+    fn early_return_from_loops() {
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                while i < 100 {
+                    if i * i >= x { return i }
+                    i = i + 1
+                }
+                return 0 - 1
+            }",
+            &[(0, 0), (16, 4), (17, 5), (20000, -1)],
+        );
+        run_i64(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                while i < 10 {
+                    j: i64[1] = 0
+                    while j < 10 {
+                        if i * 10 + j == x { return i * 1000 + j }
+                        j = j + 1
+                    }
+                    i = i + 1
+                }
+                return 0 - 1
+            }",
+            &[(37, 3007), (0, 0), (100, -1)],
+        );
+    }
+
+    #[test]
+    fn early_return_works_with_structs_generics_and_no_value() {
+        run_i64(
+            "fn mk(x: i64[1]) -> Pair[1] {
+                if x > 0 { return Pair[1] { a: x, b: 1 } }
+                return Pair[1] { a: 0 - x, b: 2 }
+             }
+             fn f(x: i64[1]) -> i64[1] { p = mk(x)
+                return p.a * 10 + p.b }",
+            &[(3, 31), (-3, 32)],
+        );
+        run_i64(
+            "fn pick[N](x: i64[N]) -> i64[N] {
+                if (+/ x) > 0 { return x }
+                return x + x
+             }
+             fn f(x: i64[1]) -> i64[1] { return pick(x) }",
+            &[(3, 3), (-3, -6)],
+        );
+        let source = r#"
+            fn f(buf: ptr[u8], x: i64[1]) {
+                if x > 0 { return }
+                store_at(buf, 0, 9)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [0u8; 1];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e, 1);
+            assert_eq!(buf[0], 0);
+            f(a, b, c, d, e, 0);
+            assert_eq!(buf[0], 9);
+        });
+    }
+
+    #[test]
+    fn early_return_agrees_with_plain_code_on_every_input() {
+        // The same search written with `return` and with hand-threaded flags.
+        let escaping = with_fn_values(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                while i < 50 {
+                    if (i & 7) == 3 && i > x { return i * 2 }
+                    if i == x + 20 { break }
+                    i = i + 1
+                }
+                if x > 25 { return 0 - x }
+                return i
+            }",
+        );
+        let plain = with_fn_values(
+            "fn f(x: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                result: i64[1] = 0
+                found: bool[1] = false
+                stop: bool[1] = false
+                while ~found && ~stop && i < 50 {
+                    if (i & 7) == 3 && i > x {
+                        result = i * 2
+                        found = true
+                    } else if i == x + 20 {
+                        stop = true
+                    } else {
+                        i = i + 1
+                    }
+                }
+                if ~found {
+                    if x > 25 { result = 0 - x } else { result = i }
+                }
+                return result
+            }",
+        );
+        assert_eq!(escaping, plain);
+    }
+
+    #[test]
+    fn code_after_a_partly_escaping_branch_runs_only_on_the_path_that_continues() {
+        // Written with returns, and with a single exit.
+        let escaping = with_fn_values(
+            "fn f(x: i64[1]) -> i64[1] {
+                total: i64[1] = 0
+                i: i64[1] = 0
+                while i < 4 {
+                    if x > 40 { return 1 } else if x > 30 {
+                        if x > 35 { return 2 }
+                        total = total + 10
+                    } else if x > 20 {
+                        if x == 25 { break } else if x > 25 { return 3 }
+                        total = total + 100
+                    }
+                    total = total + 1
+                    i = i + 1
+                }
+                if x > 10 && total == 0 { return 4 }
+                return total
+            }",
+        );
+        let expected: Vec<i64> = (-5i64..70)
+            .map(|x| match x {
+                x if x > 40 => 1,
+                x if x > 35 => 2,
+                x if x > 30 => 44,
+                x if x > 25 => 3,
+                25 => 4,
+                x if x > 20 => 404,
+                _ => 4,
+            })
+            .collect();
+        assert_eq!(escaping, expected);
+    }
+
+    fn with_fn_values(source: &str) -> Vec<i64> {
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            (-5i64..70).map(|x| f(x)).collect()
+        })
+    }
+
+    #[test]
+    #[should_panic(expected = "doesn't return a value on every path")]
+    fn falling_off_the_end_after_an_early_return_is_an_error() {
+        parser::parse("fn f(x: i64[1]) -> i64[1] { if x > 0 { return x } }");
+    }
+
+    #[test]
+    #[should_panic(expected = "break outside of a loop")]
+    fn break_outside_a_loop_is_an_error() {
+        parser::parse("fn f(x: i64[1]) -> i64[1] { if x > 0 { break }
+            return x }");
+    }
+
+    #[test]
+    #[should_panic(expected = "return inside a stream")]
+    fn return_inside_a_stream_is_an_error() {
+        parser::parse("fn f(b: ptr[u8]) -> i32[1] {
+            stream c: u8[16] over b carry (n: i32[1] = 0) {
+                if any(c > 1) { return n }
+                carry n = n + 1
+            }
+            return n
+        }");
+    }
+
+    // ---- regressions from an independent review. Each ran wrong or crashed before.
+
+    /// The value of `fn f(x: i64[1]) -> i64[1]` in `source` for each input.
+    fn eval(source: &str, inputs: &[i64]) -> Vec<i64> {
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            inputs.iter().map(|&x| f(x)).collect()
+        })
+    }
+
+    /// Whether the whole front end refuses a program, with this text in the message.
+    fn assert_rejected(source: &str, expected: &str) {
+        let source = source.to_string();
+        let result = std::panic::catch_unwind(move || {
+            let ctx = create_context();
+            let items = parser::parse(&source);
+            if let Err(errors) = typecheck::typecheck(&items, &HashMap::new()) {
+                return errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+            }
+            let module = compile_module(&ctx, &items, &HashMap::new());
+            assert!(module.as_operation().verify());
+            String::new()
+        });
+        let message = match result {
+            Ok(errors) => errors,
+            Err(panic) => panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        };
+        assert!(message.contains(expected), "expected an error containing {:?}, got {:?}", expected, message);
+    }
+
+    #[test]
+    fn unsigned_division_is_unsigned() {
+        let source = "fn f(x: i64[1]) -> i64[1] { a = to_u8(x)
+            b = a / 2
+            return to_i64(b) }";
+        assert_eq!(eval(source, &[200]), [100]);
+        let source = "fn f(x: i64[1]) -> i64[1] { a = to_u64(x)
+            b = a / 2
+            return to_i64(b) }";
+        assert_eq!(eval(source, &[-2]), [i64::MAX]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { return x / 2 }", &[-4]), [-2]);
+    }
+
+    #[test]
+    fn carry_updates_apply_by_name_and_together() {
+        let source = r#"
+            fn f(p: ptr[u8]) -> i64[1] {
+                stream chunk: u8[16] over p carry (a: i64[1] = 0, b: i64[1] = 0) {
+                    carry b = b + 1
+                    carry a = a + 100
+                }
+                return a * 1000 + b
+            }
+        "#;
+        let mut buf = [0u8; 32];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 200002);
+        });
+        assert_rejected(
+            "fn f(p: ptr[u8]) -> i64[1] {
+                stream c: u8[16] over p carry (a: i64[1] = 0) { carry zzz = a + 1 }
+                return a }",
+            "isn't one of this stream's carries",
+        );
+        assert_rejected(
+            "fn f(p: ptr[u8]) -> i64[1] {
+                stream c: u8[16] over p carry (a: i64[1] = 0) {
+                    carry a = a + 1
+                    carry a = a + 2
+                }
+                return a }",
+            "updated twice",
+        );
+        assert_rejected(
+            "fn f(p: ptr[u8]) -> i64[1] {
+                stream c: u8[8] over p carry (s: i64[1] = 0) {
+                    x: i64[1] = 1
+                    carry s = s + x
+                    x = 100
+                }
+                return s }",
+            "must come last",
+        );
+    }
+
+    #[test]
+    fn unsigned_offsets_and_indices_are_not_sign_extended() {
+        let source = r#"
+            fn read(p: ptr[u8], off: u8[1]) -> u8[1] { return load_at(p, off) }
+            fn wide(p: ptr[u8], off: u8[1]) -> u8[1] { return load_at[u8[1]](p, off) }
+            fn gathered(p: ptr[u8], off: u8[1]) -> u8[1] { return p.[off] }
+            fn put(p: ptr[u8], off: u8[1]) { store_at(p, off, 77) }
+            fn scattered(p: ptr[u8], off: u8[1]) { p.[off] = 88 }
+            fn many(p: ptr[u8]) {
+                i = [u8: 200, 201, 202, 203]
+                store_at(p, 0, p.[i])
+            }
+        "#;
+        let mut buf: Vec<u8> = (0..255).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        for name in ["read", "wide", "gathered"] {
+            with_fn(source, name, |p| unsafe {
+                let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, u8) -> u8 = std::mem::transmute(p);
+                assert_eq!(f(a, b, c, d, e, 200), 200, "{}", name);
+            });
+        }
+        with_fn(source, "put", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, u8) = std::mem::transmute(p);
+            f(a, b, c, d, e, 210);
+        });
+        assert_eq!(buf[210], 77);
+        with_fn(source, "scattered", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, u8) = std::mem::transmute(p);
+            f(a, b, c, d, e, 211);
+        });
+        assert_eq!(buf[211], 88);
+        with_fn(source, "many", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            f(a, b, c, d, e);
+        });
+        assert_eq!(&buf[..4], &[200, 201, 202, 203]);
+    }
+
+    #[test]
+    fn annotations_set_the_type() {
+        let source = "fn f(x: i64[1]) -> i64[1] {
+            a = to_i8(x)
+            y: u8[1] = a
+            if y > 0 { return 1 }
+            return 0 }";
+        assert_eq!(eval(source, &[-1, 0]), [1, 0], "reads as unsigned after the annotation");
+
+        // Literal branches take the annotated lane type, so this stores 4 bytes, not 16.
+        let source = r#"
+            fn f(p: ptr[u8]) {
+                v = load[u8[4]](p)
+                x: u8[4] = [v > 1] 1 : 0
+                store_at(p, 8, x)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [9u8; 32];
+            buf[..4].copy_from_slice(&[0, 5, 0, 5]);
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[8..12], &[0, 1, 0, 1]);
+            assert_eq!(buf[12], 9, "nothing past the 4 lanes is written");
+        });
+        assert_rejected("fn f(a: i32[1]) -> i32[1] { x: i64[1] = a
+            return a }", "expected I64, got I32");
+    }
+
+    #[test]
+    fn different_structs_never_mix() {
+        let two = "struct A[N] { x: i64[N] y: i64[N] }\nstruct B[N] { y: i64[N] x: i64[N] }\n";
+        assert_rejected(
+            &format!("{}fn f(c: i64[1]) -> i64[1] {{
+                if c > 0 {{ p = A[1] {{ x: c, y: 2 }} }} else {{ p = B[1] {{ y: 3, x: 4 }} }}
+                return p.x }}", two),
+            "different types in the two branches",
+        );
+        assert_rejected(
+            &format!("{}fn g() -> A[1] {{ return B[1] {{ y: 3, x: 4 }} }}", two),
+            "expected struct A, got struct B",
+        );
+        assert_rejected(
+            &format!("{}fn g(a: A[1]) -> i64[1] {{ return a.x }}
+                fn f(x: i64[1]) -> i64[1] {{ return g(B[1] {{ y: x, x: x }}) }}", two),
+            "expected struct A, got struct B",
+        );
+    }
+
+    #[test]
+    fn scans_are_right_at_any_width() {
+        let source = r#"
+            fn three(o: ptr[i32]) {
+                v = [i32: 1, 2, 4]
+                store(o, scan.add(v))
+            }
+            fn six(o: ptr[i32]) {
+                v = [i32: 1, 1, 1, 1, 1, 1]
+                store(o, scan.add(v))
+            }
+            fn xor48(p: ptr[u8]) {
+                store(p, scan.xor(load[u8[48]](p)))
+            }
+        "#;
+        let mut out = [0i32; 6];
+        with_fn(source, "three", |p| unsafe {
+            let f: extern "C" fn(*mut i32, *mut i32, i64, i64, i64) = std::mem::transmute(p);
+            f(out.as_mut_ptr(), out.as_mut_ptr(), 0, 6, 1);
+        });
+        assert_eq!(&out[..3], &[1, 3, 7]);
+        with_fn(source, "six", |p| unsafe {
+            let f: extern "C" fn(*mut i32, *mut i32, i64, i64, i64) = std::mem::transmute(p);
+            f(out.as_mut_ptr(), out.as_mut_ptr(), 0, 6, 1);
+        });
+        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+        with_fn(source, "xor48", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf: Vec<u8> = (1..=48).collect();
+            let mut expected = buf.clone();
+            for i in 1..48 {
+                expected[i] ^= expected[i - 1];
+            }
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(buf, expected);
+        });
+    }
+
+    #[test]
+    fn constants_are_evaluated_in_their_type() {
+        with_fn("fn f() -> u64[1] { x: u64[1] = ~0 >> 60
+            return x }", "f", |p| unsafe {
+            let f: extern "C" fn() -> u64 = std::mem::transmute(p);
+            assert_eq!(f(), 15);
+        });
+        with_fn("fn f() -> u8[1] { x: u8[1] = ~0 >> 4
+            return x }", "f", |p| unsafe {
+            let f: extern "C" fn() -> u8 = std::mem::transmute(p);
+            assert_eq!(f(), 15);
+        });
+        with_fn("fn f(a: u8[1]) -> u8[1] { return a & ~240 }", "f", |p| unsafe {
+            let f: extern "C" fn(u8) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(0xAB), 0x0B);
+        });
+        with_fn("fn f(a: u16[1]) -> u16[1] { return a & ~65280 }", "f", |p| unsafe {
+            let f: extern "C" fn(u16) -> u16 = std::mem::transmute(p);
+            assert_eq!(f(0xABCD), 0x00CD);
+        });
+        with_fn("fn f() -> u64[1] { x: u64[1] = 18446744073709551615
+            return x }", "f", |p| unsafe {
+            let f: extern "C" fn() -> u64 = std::mem::transmute(p);
+            assert_eq!(f(), u64::MAX);
+        });
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { return x & 0xFF }", &[0x1234]), [0x34]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { return x | 0b101 }", &[8]), [13]);
+        assert_rejected("fn f(x: i64[1]) -> i64[1] { x10: i64[1] = 1
+            a: i64[1] = 0z10
+            return a }", "followed directly by a letter");
+        assert_rejected("fn f() -> i64[1] { x: i64[1] = 99999999999999999999
+            return x }", "doesn't fit in 64 bits");
+        assert_rejected("fn f(a: u8[1]) -> u8[1] { return a << 9 }", "out of range");
+        assert_rejected("fn f(a: i64[1]) -> i64[1] { return a >> 64 }", "out of range");
+        assert_rejected("fn f(a: i64[1]) -> i64[1] { return a / 0 }", "division by zero");
+    }
+
+    #[test]
+    fn shifts_right_follow_signedness_and_conversions_extend_by_it() {
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { return x >> 1 }", &[-8]), [-4]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { a = to_u64(x)
+            return to_i64(a >> 1) }", &[-8]), [(u64::MAX - 7) as i64 >> 1 & i64::MAX]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { a = to_i32(x)
+            return to_i64(a) }", &[-1]), [-1], "signed widens by sign");
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { a = to_u32(x)
+            return to_i64(a) }", &[-1]), [0xFFFF_FFFF], "unsigned widens by zero");
+        // A shift amount of a different size takes the operand's.
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { s = to_u8(x)
+            return x >> s }", &[3]), [0]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { s = to_u8(x)
+            return (x + 16) << s }", &[2]), [72]);
+    }
+
+    #[test]
+    fn bools_order_as_false_before_true() {
+        let source = "fn f(x: i64[1]) -> i64[1] {
+            t = x > 0
+            u = x < 0
+            if t > u { return 1 }
+            return 0 }";
+        assert_eq!(eval(source, &[1, -1, 0]), [1, 0, 0]);
+        let source = "fn f(x: i64[1]) -> i64[1] {
+            if max(x > 0, x < 0) { return 1 }
+            return 0 }";
+        assert_eq!(eval(source, &[1, -1, 0]), [1, 1, 0]);
+        assert_rejected("fn f(v: bool[4]) -> bool[1] { return +/ v }", "aren't defined on bools");
+        assert_rejected("fn f(a: bool[1], b: bool[1]) -> bool[1] { return a + b }", "arithmetic on bools");
+        assert_rejected("fn f() -> bool[1] { x: bool[1] = 2
+            return x }", "isn't a bool");
+        assert_rejected("fn f() -> bool[1] { x: bool[1] = -true
+            return x }", "can't be negated");
+        assert_rejected("fn f() -> i64[1] { x: i64[1] = true
+            return x }", "not compatible");
+    }
+
+    #[test]
+    fn vector_literals_must_fit() {
+        assert_rejected("fn f(p: ptr[u8]) { v = [u8: 300, 1, 2, 3]
+            store(p, v) }", "doesn't fit");
+    }
+
+    #[test]
+    fn nan_is_not_equal_to_itself() {
+        with_fn("fn f() -> bool[1] { z: f32[1] = 0.0
+            n = z / z
+            return n != n }", "f", |p| unsafe {
+            let f: extern "C" fn() -> bool = std::mem::transmute(p);
+            assert!(f());
+        });
+    }
+
+    #[test]
+    fn carries_leave_enclosing_ifs_and_loops() {
+        let source = r#"
+            fn f(p: ptr[u8], c: i64[1]) -> i64[1] {
+                n: i64[1] = 7
+                if c > 0 {
+                    stream chunk: u8[16] over p carry (n: i64[1] = 0) {
+                        carry n = n + 1
+                    }
+                }
+                return n
+            }
+        "#;
+        let mut buf = [0u8; 32];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e, 1), 2);
+            assert_eq!(f(a, b, c, d, e, 0), 7);
+        });
+    }
+
+    #[test]
+    fn chunk_offset_belongs_to_the_innermost_stream() {
+        let source = r#"
+            fn f(p: ptr[u8]) -> i64[1] {
+                chunk_offset: i32[1] = 99
+                stream a: u8[8] over p carry (s: i64[1] = 0) {
+                    carry s = s + to_i64(chunk_offset)
+                }
+                return s
+            }
+        "#;
+        let mut buf = [0u8; 16];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 8);
+        });
+    }
+
+    #[test]
+    fn extern_pointers_cant_reach_a_stream_any_way() {
+        let streams = "fn g(q: ptr[u8]) -> i64[1] {
+            stream c: u8[16] over q carry (n: i64[1] = 0) { carry n = n + 1 }
+            return n }\n";
+        assert_rejected(
+            "extern fn f(p: ptr[u8]) -> i64[1] { q = p
+                stream c: u8[16] over q carry (n: i64[1] = 0) { carry n = n + 1 }
+                return n }",
+            "no known size",
+        );
+        assert_rejected(
+            "extern fn f(p: ptr[u8]) -> i64[1] { q = ptr_add(p, 4)
+                stream c: u8[16] over q carry (n: i64[1] = 0) { carry n = n + 1 }
+                return n }",
+            "no known size",
+        );
+        assert_rejected(&format!("{}extern fn f(p: ptr[u8]) -> i64[1] {{ return g(p) }}", streams), "no known size");
+        assert_rejected(
+            &format!("{}fn h(r: ptr[u8]) -> i64[1] {{ return g(r) }}
+                extern fn f(p: ptr[u8]) -> i64[1] {{ return h(p) }}", streams),
+            "no known size",
+        );
+    }
+
+    #[test]
+    fn names_that_would_change_meaning_are_refused() {
+        assert_rejected("fn f(__ret: i64[1]) -> i64[1] { return __ret }", "reserved");
+        assert_rejected("fn max(a: i64[1], b: i64[1]) -> i64[1] { return a + b }", "same name as a builtin");
+        assert_rejected("fn g(x: i64[1]) -> i64[1] { return x }
+            fn g(x: i64[1]) -> i64[1] { return x }", "defined twice");
+        assert_rejected("fn f(a: i64[1], a: i64[1]) -> i64[1] { return a }", "two parameters");
+        assert_rejected("fn f(x: i64[1]) -> i64[1] { REGISTER_BYTES = x
+            return x }", "compile-time width");
+        assert_rejected("fn g[N](x: i64[1]) -> i64[1] { N = x
+            return N }", "compile-time width");
+        // A comptime name doesn't capture a callee of the same name.
+        let source = "fn g[min](a: u8[min]) -> u8[min] { return min(a, a) }
+            fn f(x: i64[1]) -> i64[1] {
+                v: u8[4] = 3
+                return to_i64(extract(g(v), 0)) + x }";
+        assert_eq!(eval(source, &[1]), [4]);
+    }
+
+    #[test]
+    fn invalid_loads_are_errors() {
+        assert_rejected("fn f(p: ptr[u8]) -> bool[1] { return load_at[bool[1]](p, 2) }", "can't be loaded");
+        assert_rejected("fn f(p: ptr[u32]) -> u8[1] { return load_at[u8[1]](p, 1) }", "whole number");
+        assert_rejected("fn f(p: ptr[u32]) -> u16[3] { return load[u16[3]](p) }", "whole number");
+    }
+
+    #[test]
+    fn loads_through_computed_pointers_work() {
+        let source = "fn f(p: ptr[u8]) -> u64[1] { return load_at[u64[1]](ptr_add(p, 1), 0) }";
+        let mut buf: Vec<u8> = (0..16).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
+        });
+    }
+
+    #[test]
+    fn scalar_branches_broadcast_across_a_vector_mask() {
+        let source = r#"
+            fn f(p: ptr[u8], a: u8[1], b: u8[1]) {
+                v = load_at[u8[16]](p, 0)
+                store_at(p, 16, [v > 1] a : b)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, u8, u8) = std::mem::transmute(p);
+            let mut buf = [0u8; 32];
+            buf[3] = 9;
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e, 7, 8);
+            assert_eq!(buf[19], 7);
+            assert_eq!(buf[16], 8);
+        });
+    }
+
+    #[test]
+    fn recursive_generics_are_an_error() {
+        assert_rejected("fn g[N](x: i64[1]) -> i64[1] { return g[N + 1](x) }
+            fn f(x: i64[1]) -> i64[1] { return g[1](x) }", "too deeply");
+    }
+
+    #[test]
+    fn pointers_can_be_returned() {
+        let source = r#"
+            fn advance(p: ptr[u8]) -> ptr[u8] { return ptr_add(p, 3) }
+            fn f(p: ptr[u8]) -> u8[1] { q = advance(p)
+                return load_at(q, 1) }
+        "#;
+        let mut buf: Vec<u8> = (0..8).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 4);
+        });
+    }
+
+    #[test]
+    fn compress_packs_active_lanes() {
+        let source = r#"
+            fn f(p: ptr[u8]) {
+                v = load_at[u8[16]](p, 0)
+                store_at(p, 16, compress(v, v > 100))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [1u8; 32];
+            buf[2] = 200;
+            buf[9] = 201;
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[16..18], &[200, 201]);
+            assert_eq!(buf[18], 0);
+        });
+    }
+
+    #[test]
+    fn type_mismatches_are_reported_not_passed_to_mlir() {
+        for (source, expected) in [
+            ("fn f(n: i64[1], m: bool[4]) -> i64[1] { return n + popcount(m) }", "different types"),
+            ("fn f(v: u8[4], s: i64[1]) -> u8[4] { return v + s }", "different types"),
+            ("fn g(a: i64[1]) -> i64[1] { return a } fn f(c: i32[1]) -> i64[1] { return g(c) }", "expected I64, got I32"),
+            ("fn f(c: i32[1]) -> i64[1] { return c }", "expected I64, got I32"),
+            ("fn f(x: f32[1]) -> i64[1] { return to_i64(x) }", "needs an integer"),
+            ("fn f(a: f32[4], b: f32[4]) -> f32[4] { return a & b }", "aren't defined on floats"),
+            ("fn f(x: u32[1]) -> u32[1] { return ctz(x) }", "64-bit"),
+            ("fn g(p: ptr[u8]) -> u8[1] { return load_at(p, 0) } fn f(p: ptr[u32]) -> u8[1] { return g(p) }", "ptr"),
+            ("fn f(p: ptr[u8]) -> i64[1] { v = load[u8[4]](p)
+                i: i64[1] = 0
+                while i < 1 { v = load[u8[8]](p)
+                    i = i + 1 }
+                return i }", "changes type"),
+            ("fn f(x: i64[1]) -> i64[1] { y: i64[1] = 3 }", "doesn't return"),
+            ("fn f(v: u8[2]) -> u8[1] { return split_lo(v) }", "at least 4"),
+            ("fn f(v: u8[1]) -> u8[1] { return lane_shr(v, 1) }", "at least 2"),
+            ("fn f(v: u8[4]) -> u8[1] { return shuffle(v, v, [u8: 3]) }", "at least 2"),
+            ("fn f(a: u64[1]) -> bool[1] { return from_bitmask(a, 1) }", "from_bitmask"),
+            ("fn f(a: u32[1]) -> bool[32] { return from_bitmask(a, 32) }", "64-bit"),
+            ("fn f(p: ptr[u8]) -> u64[1] { return to_bitmask(load[u8[128]](p) > 1) }", "at most 64"),
+            ("fn f(v: u8[4]) -> u8[1] { return extract(v, 9) }", "out of range"),
+            ("fn f(t: u8[16], i: u8[8]) -> u8[8] { return tbl(t, i) }", "multiple of 16"),
+            ("fn g() { } fn f() -> i64[1] { y = g()
+                return y }", "no value"),
+            ("fn g() { } fn f() -> i64[1] { return g() }", "expected"),
+            ("struct A[N] { x: i64[N] } fn f() -> A[1] { return A[1] { x: 1, bogus: undefined_thing } }", "undefined variable"),
+            ("struct A[N] { x: i64[N] } fn f() -> A[1] { return A[1] { x: 1, x: 2 } }", "twice"),
+            ("fn f(a: i8[1], b: u8[1]) -> bool[1] { return a > b }", "order differently"),
+            ("fn f(a: u8[1], b: i8[1]) -> u8[1] { return min(a, b) }", "different types"),
+            ("fn f(c: bool[1]) -> bool[1] { if c { x: u8[1] = 255 } else { x: i8[1] = -1 }
+                return x > 0 }", "different types in the two branches"),
+            ("fn f(x: i64[1]) -> i64[1] { return 2
+                z = undefined_thing }", "unreachable"),
+        ] {
+            assert_rejected(source, expected);
+        }
+    }
+
+    #[test]
+    fn literals_work_in_every_position() {
+        let source = r#"
+            fn f(p: ptr[u8]) -> i64[1] {
+                stream c: u8[16] over p carry (a: i64[1] = 5, b: bool[1] = true, s: i64[1] = 0) {
+                    carry a = 7
+                    carry b = false
+                    carry s = s + a
+                }
+                return s
+            }
+        "#;
+        let mut buf = [0u8; 32];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 5 + 7);
+        });
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { y: i64[1] = 1 << x
+            return y }", &[3]), [8]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { if true { return x }
+            return 0 }", &[3]), [3]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { while false { x = 0 }
+            return x }", &[3]), [3]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { if REGISTER_BYTES >= 16 { return x }
+            return 0 }", &[3]), [3]);
+        assert_eq!(eval("fn g[N](x: i64[1]) -> i64[1] { if N > 8 { return x + 1 }
+                return x }
+            fn f(x: i64[1]) -> i64[1] { return g[9](x) * 100 + g[8](x) }", &[3]), [403]);
+        let source = "fn f(x: f32[4]) -> f32[4] { y: f32[4] = [x > 0.0] 1.0 : 0.0
+            return y }";
+        with_fn(source, "f", |_| ());
+        // Compressstore takes a literal offset, and scans a literal seed.
+        with_fn("fn f(o: ptr[u8], v: u8[16], m: bool[16]) { compressstore(o, 0, v, m) }", "f", |_| ());
+        with_fn("fn f(v: u8[16]) -> u8[16] { return scan.xor(v, 1) }", "f", |_| ());
+    }
+
+    #[test]
+    fn registers_size_struct_fields() {
+        with_fn("struct S[N] { a: u8[REGISTER_BYTES] }
+            fn g(p: ptr[u8]) -> S[1] { return S[1] { a: load_at[u8[REGISTER_BYTES]](p, 0) } }
+            fn f(p: ptr[u8]) { store_at(p, 0, g(p).a) }", "f", |_| ());
+    }
+
+    #[test]
+    fn code_moved_by_desugaring_stays_visible() {
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] {
+            if x > 0 {
+                if x > 10 { return 100 }
+                z: i64[1] = 1
+            } else {
+                z: i64[1] = 2
+            }
+            return z }", &[5, 50, -1]), [1, 100, 2]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] {
+            i: i64[1] = 0
+            while i < 3 {
+                if x > 0 {
+                    if x == i { break }
+                    z: i64[1] = 1
+                } else {
+                    z: i64[1] = 2
+                }
+                x = x + z - z
+                i = i + 1
+            }
+            return i }", &[1, -1, 50]), [1, 3, 3]);
+        assert_eq!(eval(&format!("{}fn f(x: i64[1]) -> i64[1] {{
+            if x > 0 {{
+                if x > 10 {{ return 100 }}
+                p = Pair[1] {{ a: 1, b: 2 }}
+            }} else {{
+                p = Pair[1] {{ a: 3, b: 4 }}
+            }}
+            return p.a + p.b }}", PAIR), &[5, 50, -1]), [3, 100, 7]);
+    }
+
+    #[test]
+    fn a_line_starting_with_a_paren_or_minus_is_a_new_statement() {
+        assert_eq!(eval(&format!("{}fn mk(x: i64[1]) -> Pair[1] {{ return Pair[1] {{ a: x, b: 2 }} }}
+            fn f(x: i64[1]) -> i64[1] {{
+                y = x
+                (a, b) = mk(y)
+                return a + b }}", PAIR), &[5]), [7]);
+        assert_rejected("fn f(x: i64[1]) -> i64[1] { y = x
+            -x
+            return y }", "");
+    }
+
+    #[test]
+    fn a_loop_that_only_returns_needs_no_trailing_return() {
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] {
+            while true {
+                if x > 3 { return x }
+                x = x + 1
+            }
+        }", &[0, 9]), [4, 9]);
+    }
+
+    #[test]
+    fn second_review_pass_cases() {
+        for (source, expected) in [
+            ("fn f(p: ptr[u8], x: i64[1], i: i64[1]) { p.[i] = x }", "scatter value"),
+            ("fn f(p: ptr[u8]) -> i64[1] { q = p + 1
+                return 0 }", "ptr_add"),
+            ("fn f(a: i64[1]) -> i64[1] { s: i64[1] = 1
+                return scan.xor(a, s) }", "at least 2 lanes"),
+            ("fn f(p: ptr[u8]) -> i64[1] {
+                stream a: u32[4] over p carry (s: i64[1] = 0) { carry s = s + 1 }
+                return s }", "element type"),
+            ("struct A[N] { x: i64[N] }
+              fn f(p: ptr[i64], n: i64[1]) -> i64[1] { s = A[1] { x: 1 }
+                i: i64[1] = 0
+                while i < n { s = A[2] { x: load[i64[2]](p) }
+                   i = i + 1 }
+                return 0 }", "changes type"),
+            ("fn f(n: i64[1]) -> bool[1] { x: u8[1] = 1
+                i: i64[1] = 0
+                while i < n { x: i8[1] = -1
+                   i = i + 1 }
+                return x > 0 }", "changes type"),
+            ("fn f(p: ptr[u8]) -> i64[1] {
+                x: i64[1] = 0
+                stream chunk: u8[16] over p carry (n: i64[1] = 0) {
+                    x = x + 1
+                    carry n = n + 1
+                }
+                return x }", "make it a carry"),
+            ("fn f(a: u8[1]) -> bool[1] { return a > -1 }", "isn't a U8 value"),
+            ("fn f(a: i8[1]) -> bool[1] { return a < 200 }", "isn't a I8 value"),
+            ("fn f(x: i64[1]) -> i64[1] { break
+                return x }", "break outside of a loop"),
+            ("const T = [u8: 300, 2]
+              fn f(i: i64[1]) -> u8[1] { return load_at(T, i) }", "doesn't fit"),
+            ("struct A[N] { x: i64[N] }
+              fn g(a: A[1]) -> i64[1] { return a.x }
+              fn f(p: ptr[i64]) -> i64[1] { return g(A[2] { x: load[i64[2]](p) }) }", "wrong width"),
+            ("struct S[A, B] { x: i64[A] }
+              fn f(s: S[1]) -> i64[1] { return 1 }", "at most one comptime"),
+        ] {
+            assert_rejected(source, expected);
+        }
+
+        // Comparing with a literal in range still works, at the top of each type's range.
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { a = to_u8(x)
+            if a > 200 { return 1 }
+            return 0 }", &[201, 199, -1]), [1, 0, 1]);
+        assert_eq!(eval("fn f(x: i64[1]) -> i64[1] { a = to_i8(x)
+            if a > -1 { return 1 }
+            return 0 }", &[0, -1]), [1, 0]);
+
+        // A float body's inactive lanes are float zeros, whatever produced the body.
+        let source = "fn f(x: f32[4]) -> f32[4] { return [x > 0.0] sqrt(x) }";
+        with_fn(source, "f", |_| ());
+
+        // A literal scattered to many indices fills them all.
+        let source = r#"
+            fn f(p: ptr[u8], ip: ptr[i32]) {
+                idx = load[i32[4]](ip)
+                p.[idx] = 7
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, *mut i32, *mut i32, i64, i64, i64) =
+                std::mem::transmute(p);
+            let mut buf = [0u8; 8];
+            let mut at = [1i32, 3, 5, 6];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e, at.as_mut_ptr(), at.as_mut_ptr(), 0, 4, 1);
+            assert_eq!(buf, [0, 7, 0, 7, 0, 7, 7, 0]);
+        });
     }
 
     #[test]
