@@ -46,3 +46,8 @@ dist/
 .DS_Store
 .claude/settings.local.json
 /target/
+/build
+
+json-escape/fixtures/
+json-escape/target/
+.worktrees/

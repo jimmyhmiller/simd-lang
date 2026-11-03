@@ -141,6 +141,16 @@ pub struct ComptimeParam {
 pub enum Item {
     Struct(StructDef),
     Fn(FnDef),
+    Const(ConstDef),
+}
+
+/// A read-only table in static storage: `const NAME = [u8: 1, 2, 3]`.
+/// Inside functions `NAME` is a pointer to its first element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstDef {
+    pub name: String,
+    pub elem_type: String,
+    pub values: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +168,16 @@ pub struct FieldDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDef {
+    /// `noinline fn`: stays a real call, keeping cold code and the constants LLVM
+    /// would hoist from it out of the caller's hot path.
+    pub noinline: bool,
+    /// `private fn`: internal to the object, with no exported symbol or binding, so
+    /// LLVM may rewrite its signature (dropping unused memref descriptor fields).
+    pub private: bool,
+    /// `extern fn`: exported with the C ABI, each `ptr[T]` a plain pointer instead of
+    /// a five-word memref descriptor. The pointee size is unknown to the function,
+    /// so it can't `stream` over those pointers.
+    pub extern_c: bool,
     pub name: String,
     pub comptime_params: Vec<ComptimeParam>,
     pub params: Vec<Param>,

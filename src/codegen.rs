@@ -1,3 +1,5 @@
+use melior::ir::r#type::TypeLike;
+use melior::ir::ValueLike;
 use std::collections::HashMap;
 
 use melior::{
@@ -96,8 +98,28 @@ pub struct VecType {
 }
 
 impl VecType {
+    /// `T[1]` is a plain scalar `T`, not `vector<1xT>`: integer scalars live in
+    /// general-purpose registers, branch directly, and address memory without a
+    /// trip through the vector register file.
     fn to_mlir_type<'c>(&self, ctx: &'c Context) -> Type<'c> {
-        Type::vector(&[self.width], self.scalar.to_mlir_type(ctx))
+        if self.width == 1 {
+            self.scalar.to_mlir_type(ctx)
+        } else {
+            Type::vector(&[self.width], self.scalar.to_mlir_type(ctx))
+        }
+    }
+}
+
+/// A constant attribute for a value of type `ty`: a dense vector, or the bare
+/// element attribute when `ty` is a scalar (a width-1 language value).
+fn splat_attr<'c>(
+    ty: Type<'c>,
+    values: &[melior::ir::attribute::Attribute<'c>],
+) -> Result<melior::ir::attribute::Attribute<'c>, melior::Error> {
+    if ty.is_vector() {
+        Ok(DenseElementsAttribute::new(ty, values)?.into())
+    } else {
+        Ok(values[0])
     }
 }
 
@@ -293,7 +315,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     })
                     .collect();
 
-                let dense = DenseElementsAttribute::new(vec_mlir, &attrs)
+                let dense = splat_attr(vec_mlir, &attrs)
                     .expect("failed to create vector literal");
                 let op = arith::constant(self.ctx, dense.into(), self.loc);
                 let val = self.block.append_operation(op).result(0).unwrap().into();
@@ -317,7 +339,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 }
                 let scalar_type = target.scalar.to_mlir_type(self.ctx);
                 let attr = FloatAttribute::new(self.ctx, scalar_type, *f);
-                let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                let splat = splat_attr(vec_type, &[attr.into()])
                     .expect("failed to create splat attribute");
                 let op = arith::constant(self.ctx, splat.into(), self.loc);
                 let val = self.block.append_operation(op).result(0).unwrap().into();
@@ -329,7 +351,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 }
                 let scalar_type = target.scalar.to_mlir_type(self.ctx);
                 let attr = IntegerAttribute::new(scalar_type, *n);
-                let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                let splat = splat_attr(vec_type, &[attr.into()])
                     .expect("failed to create splat attribute");
                 let op = arith::constant(self.ctx, splat.into(), self.loc);
                 let val = self.block.append_operation(op).result(0).unwrap().into();
@@ -342,7 +364,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 }
                 let scalar_type = target.scalar.to_mlir_type(self.ctx);
                 let attr = IntegerAttribute::new(scalar_type, *ch as i64);
-                let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                let splat = splat_attr(vec_type, &[attr.into()])
                     .expect("failed to create splat attribute");
                 let op = arith::constant(self.ctx, splat.into(), self.loc);
                 let val = self.block.append_operation(op).result(0).unwrap().into();
@@ -357,7 +379,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         let vec_type = ty.to_mlir_type(self.ctx);
                         let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                         let ones_attr = IntegerAttribute::new(scalar_type, -1);
-                        let splat = DenseElementsAttribute::new(vec_type, &[ones_attr.into()])
+                        let splat = splat_attr(vec_type, &[ones_attr.into()])
                             .expect("failed to create all-ones splat");
                         let ones = self
                             .block
@@ -386,7 +408,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                             let vec_type = ty.to_mlir_type(self.ctx);
                             let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                             let zero_attr = IntegerAttribute::new(scalar_type, 0);
-                            let splat = DenseElementsAttribute::new(vec_type, &[zero_attr.into()])
+                            let splat = splat_attr(vec_type, &[zero_attr.into()])
                                 .expect("failed to create zero splat");
                             let zero = self
                                 .block
@@ -430,22 +452,32 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
     ) -> (Value<'c, 'a>, VecType) {
         // Bit shift: RHS is a compile-time integer constant, broadcast to match LHS width
         if op == ast::BinOp::BitShl || op == ast::BinOp::BitShr {
-            let shift_amount = match rhs {
-                ast::Expr::IntLit(n) => *n,
-                _ => panic!("bit shift amount must be an integer literal"),
-            };
             let (lval, lty) = self.emit_expr(lhs);
-            let scalar_type = lty.scalar.to_mlir_type(self.ctx);
-            let vec_type = lty.to_mlir_type(self.ctx);
-            let shift_attr = IntegerAttribute::new(scalar_type, shift_amount);
-            let shift_splat =
-                DenseElementsAttribute::new(vec_type, &[shift_attr.into()]).unwrap();
-            let shift_vec: Value = self
-                .block
-                .append_operation(arith::constant(self.ctx, shift_splat.into(), self.loc))
-                .result(0)
-                .unwrap()
-                .into();
+            // A literal amount broadcasts to the left operand; otherwise the amount
+            // is a value (per-lane when wide, or a scalar broadcast across lanes).
+            let shift_vec: Value = if let ast::Expr::IntLit(n) = rhs {
+                let scalar_type = lty.scalar.to_mlir_type(self.ctx);
+                let vec_type = lty.to_mlir_type(self.ctx);
+                let shift_attr = IntegerAttribute::new(scalar_type, *n);
+                let shift_splat = splat_attr(vec_type, &[shift_attr.into()]).unwrap();
+                self.block
+                    .append_operation(arith::constant(self.ctx, shift_splat.into(), self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            } else {
+                let (rval, rty) = self.emit_expr(rhs);
+                if rty.width == 1 && lty.width > 1 {
+                    self.emit_broadcast_to_width(rval, rty, lty.width).0
+                } else if rty.width != lty.width {
+                    self.error(&format!(
+                        "shift amount width {} does not match operand width {}",
+                        rty.width, lty.width
+                    ));
+                } else {
+                    rval
+                }
+            };
             let result_op = if op == ast::BinOp::BitShl {
                 arith::shli(lval, shift_vec, self.loc)
             } else {
@@ -615,19 +647,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         target_width: u64,
     ) -> (Value<'c, 'a>, VecType) {
         assert_eq!(ty.width, 1, "can only broadcast width-1 vectors");
-        let scalar_type = ty.scalar.to_mlir_type(self.ctx);
-
-        // Extract the scalar from width-1 vector
-        let extract_op = OperationBuilder::new("vector.extract", self.loc)
-            .add_operands(&[val])
-            .add_results(&[scalar_type])
-            .add_attributes(&[(
-                melior::ir::Identifier::new(self.ctx, "static_position"),
-                DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-            )])
-            .build()
-            .expect("failed to extract scalar for broadcast");
-        let scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
+        let scalar = val;
 
         // Broadcast to target width
         let result_ty = VecType { scalar: ty.scalar, width: target_width };
@@ -714,7 +734,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                     let vec_type = ty.to_mlir_type(self.ctx);
                     let zero_attr = IntegerAttribute::new(scalar_type, 0);
-                    let splat = DenseElementsAttribute::new(vec_type, &[zero_attr.into()])
+                    let splat = splat_attr(vec_type, &[zero_attr.into()])
                         .expect("failed to create zero splat");
                     let zero = self
                         .block
@@ -737,7 +757,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let vec_type = ty.to_mlir_type(self.ctx);
                 let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                 let ones_attr = IntegerAttribute::new(scalar_type, -1);
-                let splat = DenseElementsAttribute::new(vec_type, &[ones_attr.into()])
+                let splat = splat_attr(vec_type, &[ones_attr.into()])
                     .expect("failed to create all-ones splat");
                 let ones = self
                     .block
@@ -816,6 +836,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             scalar: ty.scalar,
             width: 1,
         };
+        if ty.width == 1 {
+            return (val, result_ty);
+        }
 
         // Use vector.reduction operation via OperationBuilder
         let kind_str = match op {
@@ -864,19 +887,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             .into();
 
         // Wrap scalar result into a width-1 vector via vector.broadcast
-        let result_mlir_type = result_ty.to_mlir_type(self.ctx);
-        let broadcast_op = OperationBuilder::new("vector.broadcast", self.loc)
-            .add_operands(&[scalar_val])
-            .add_results(&[result_mlir_type])
-            .build()
-            .expect("failed to build vector.broadcast");
-
-        let result_val = self
-            .block
-            .append_operation(broadcast_op)
-            .result(0)
-            .unwrap()
-            .into();
+        let result_val = scalar_val;
 
         (result_val, result_ty)
     }
@@ -1017,16 +1028,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
             // Extract scalar from seed (width-1 vector)
             let scalar_type = ty.scalar.to_mlir_type(self.ctx);
-            let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                .add_operands(&[seed_val])
-                .add_results(&[scalar_type])
-                .add_attributes(&[(
-                    melior::ir::Identifier::new(self.ctx, "static_position"),
-                    DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                )])
-                .build()
-                .expect("failed to extract seed scalar");
-            let seed_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
+            let seed_scalar = seed_val;
 
             // Extract lane 0 from val
             let extract_val0 = OperationBuilder::new("vector.extract", self.loc)
@@ -1198,7 +1200,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let i8t: Type = IntegerType::new(self.ctx, 8).into();
         let vt = Type::vector(&[width as u64], i8t);
         let attr = IntegerAttribute::new(i8t, val);
-        let splat = DenseElementsAttribute::new(vt, &[attr.into()]).unwrap();
+        let splat = splat_attr(vt, &[attr.into()]).unwrap();
         self.block
             .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
             .result(0)
@@ -1385,22 +1387,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         }
 
         // Running state at each byte = cur[seed][i] = select among cur[*] by seed.
-        let seed_scalar: Value<'c, 'a> = self
-            .block
-            .append_operation(
-                OperationBuilder::new("vector.extract", self.loc)
-                    .add_operands(&[seed])
-                    .add_results(&[i8t])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .unwrap(),
-            )
-            .result(0)
-            .unwrap()
-            .into();
+        let seed_scalar: Value<'c, 'a> = seed;
         let seed_bcast: Value<'c, 'a> = self
             .block
             .append_operation(
@@ -1444,13 +1431,13 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
         if ty.scalar.is_float() {
             let attr = FloatAttribute::new(self.ctx, scalar_type, 0.0);
-            let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+            let splat = splat_attr(vec_type, &[attr.into()])
                 .expect("failed to create zero splat");
             let op = arith::constant(self.ctx, splat.into(), self.loc);
             self.block.append_operation(op).result(0).unwrap().into()
         } else {
             let attr = IntegerAttribute::new(scalar_type, 0);
-            let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+            let splat = splat_attr(vec_type, &[attr.into()])
                 .expect("failed to create zero splat");
             let op = arith::constant(self.ctx, splat.into(), self.loc);
             self.block.append_operation(op).result(0).unwrap().into()
@@ -1469,7 +1456,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                 if ty.scalar.is_float() {
                     let attr = FloatAttribute::new(self.ctx, scalar_type, f64::NEG_INFINITY);
-                    let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                    let splat = splat_attr(vec_type, &[attr.into()])
                         .expect("failed to create neg_inf splat");
                     let op = arith::constant(self.ctx, splat.into(), self.loc);
                     self.block.append_operation(op).result(0).unwrap().into()
@@ -1483,7 +1470,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         _ => 0,
                     };
                     let attr = IntegerAttribute::new(scalar_type, min_val);
-                    let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                    let splat = splat_attr(vec_type, &[attr.into()])
                         .expect("failed to create min_val splat");
                     let op = arith::constant(self.ctx, splat.into(), self.loc);
                     self.block.append_operation(op).result(0).unwrap().into()
@@ -1525,7 +1512,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             let mask_mlir = mask_ty.to_mlir_type(self.ctx);
             let scalar_type = ScalarType::Bool.to_mlir_type(self.ctx);
             let attr = IntegerAttribute::new(scalar_type, 1);
-            let splat = DenseElementsAttribute::new(mask_mlir, &[attr.into()])
+            let splat = splat_attr(mask_mlir, &[attr.into()])
                 .expect("failed to create all-true mask");
             let op = arith::constant(self.ctx, splat.into(), self.loc);
             self.block.append_operation(op).result(0).unwrap().into()
@@ -1576,30 +1563,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
     ) -> (Value<'c, 'a>, VecType) {
         let (ptr_val, _ptr_ty) = self.emit_expr(ptr);
         let vec_ty = resolve_type(ty, &self.comptime_env, self.native_width);
-        let result_mlir = vec_ty.to_mlir_type(self.ctx);
-
-        let index_type = Type::index(self.ctx);
 
         // Compute index: either 0 or the offset expression (in elements of the ptr type)
-        let load_index: Value = if let Some(off_expr) = offset_expr {
-            let (off_val, off_ty) = self.emit_expr(off_expr);
-            let off_elem_ty = off_ty.scalar.to_mlir_type(self.ctx);
-            let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                .add_operands(&[off_val])
-                .add_results(&[off_elem_ty])
-                .add_attributes(&[(
-                    melior::ir::Identifier::new(self.ctx, "static_position"),
-                    DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                )])
-                .build()
-                .expect("failed to extract load offset");
-            let off_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
-            let cast_op = arith::index_cast(off_scalar, index_type, self.loc);
-            self.block.append_operation(cast_op).result(0).unwrap().into()
-        } else {
-            let zero_attr = IntegerAttribute::new(index_type, 0);
-            let zero_op = arith::constant(self.ctx, zero_attr.into(), self.loc);
-            self.block.append_operation(zero_op).result(0).unwrap().into()
+        let load_index: Value = match offset_expr {
+            Some(off_expr) => self.emit_index(off_expr),
+            None => self.make_index_const(0),
         };
 
         // Check if load type differs from ptr element type — need bitcast
@@ -1614,18 +1582,33 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
         let needs_bitcast = ptr_scalar.is_some() && ptr_scalar.unwrap() != vec_ty.scalar;
 
-        if needs_bitcast {
+        // A scalar load stays scalar: going through vector<8xi8> leaves LLVM with
+        // `load <1 x i64>`, which lands in a vector register.
+        if vec_ty.width == 1 && (!needs_bitcast || ptr_scalar == Some(ScalarType::U8)) {
+            let result = if needs_bitcast {
+                self.emit_unaligned_load(ptr_val, load_index, vec_ty.scalar)
+            } else {
+                self.emit_memref_load(ptr_val, load_index, vec_ty.scalar)
+            };
+            return (result, vec_ty);
+        }
+
+        // vector.load always yields a vector; a width-1 language value unwraps it.
+        let vector_of = |vt: VecType, ctx: &'c Context| -> Type<'c> {
+            Type::vector(&[vt.width], vt.scalar.to_mlir_type(ctx))
+        };
+
+        let loaded: Value<'c, 'a> = if needs_bitcast {
             let ptr_sc = ptr_scalar.unwrap();
             // Load as the ptr's element type with enough elements to fill the target type
             let target_bytes = vec_ty.scalar.bit_width() as u64 / 8 * vec_ty.width;
             let ptr_elem_bytes = ptr_sc.bit_width() as u64 / 8;
             let load_width = target_bytes / ptr_elem_bytes;
             let load_vt = VecType { scalar: ptr_sc, width: load_width };
-            let load_mlir = load_vt.to_mlir_type(self.ctx);
 
             let load_op = OperationBuilder::new("vector.load", self.loc)
                 .add_operands(&[ptr_val, load_index])
-                .add_results(&[load_mlir])
+                .add_results(&[vector_of(load_vt, self.ctx)])
                 .build()
                 .expect("failed to build vector.load");
             let raw = self.block.append_operation(load_op).result(0).unwrap().into();
@@ -1633,20 +1616,304 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             // Bitcast to target type
             let bitcast_op = OperationBuilder::new("vector.bitcast", self.loc)
                 .add_operands(&[raw])
-                .add_results(&[result_mlir])
+                .add_results(&[vector_of(vec_ty, self.ctx)])
                 .build()
                 .expect("failed to build vector.bitcast");
-            let result = self.block.append_operation(bitcast_op).result(0).unwrap().into();
-            (result, vec_ty)
+            self.block.append_operation(bitcast_op).result(0).unwrap().into()
         } else {
             let load_op = OperationBuilder::new("vector.load", self.loc)
                 .add_operands(&[ptr_val, load_index])
-                .add_results(&[result_mlir])
+                .add_results(&[vector_of(vec_ty, self.ctx)])
                 .build()
                 .expect("failed to build vector.load");
-            let result = self.block.append_operation(load_op).result(0).unwrap().into();
-            (result, vec_ty)
+            self.block.append_operation(load_op).result(0).unwrap().into()
+        };
+
+        (self.emit_unwrap_unit(loaded, vec_ty), vec_ty)
+    }
+
+    /// Convert between integer widths: zero-extend, truncate, or (at equal width,
+    /// where the language's signedness has no MLIR representation) pass through.
+    fn emit_int_resize(&mut self, val: Value<'c, 'a>, from: VecType, to: VecType) -> Value<'c, 'a> {
+        let (from_bits, to_bits) = (from.scalar.bit_width(), to.scalar.bit_width());
+        if from_bits == to_bits {
+            return val;
         }
+        let target = to.to_mlir_type(self.ctx);
+        let op = if from_bits < to_bits {
+            arith::extui(val, target, self.loc)
+        } else {
+            arith::trunci(val, target, self.loc)
+        };
+        self.block.append_operation(op).result(0).unwrap().into()
+    }
+
+    /// An element offset as an MLIR `index`: a literal, or a scalar integer value.
+    fn emit_index(&mut self, expr: &ast::Expr) -> Value<'c, 'a> {
+        if let ast::Expr::IntLit(n) = expr {
+            return self.make_index_const(*n);
+        }
+        let (val, ty) = self.emit_expr(expr);
+        if ty.width != 1 || !ty.scalar.is_int() {
+            self.error(&format!(
+                "memory offset must be a scalar integer, got {:?}[{}]",
+                ty.scalar, ty.width
+            ));
+        }
+        self.block
+            .append_operation(arith::index_cast(val, Type::index(self.ctx), self.loc))
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// `vector<1xT>` → `T` for a width-1 value; wider vectors pass through.
+    fn emit_unwrap_unit(&mut self, val: Value<'c, 'a>, ty: VecType) -> Value<'c, 'a> {
+        if ty.width != 1 {
+            return val;
+        }
+        self.block
+            .append_operation(
+                OperationBuilder::new("vector.extract", self.loc)
+                    .add_operands(&[val])
+                    .add_results(&[ty.scalar.to_mlir_type(self.ctx)])
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "static_position"),
+                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
+                    )])
+                    .build()
+                    .expect("failed to unwrap unit vector"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// The LLVM struct behind a `memref<?xT>`: allocated, aligned, offset, size, stride.
+    fn emit_memref_descriptor(&mut self, buf: Value<'c, 'a>) -> Value<'c, 'a> {
+        let descriptor_ty = Type::parse(
+            self.ctx,
+            "!llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>",
+        )
+        .expect("failed to parse memref descriptor type");
+        self.block
+            .append_operation(
+                OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                    .add_operands(&[buf])
+                    .add_results(&[descriptor_ty])
+                    .build()
+                    .expect("failed to cast memref to descriptor"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    fn emit_descriptor_field(&mut self, descriptor: Value<'c, 'a>, position: &[i64], ty: Type<'c>) -> Value<'c, 'a> {
+        self.block
+            .append_operation(
+                OperationBuilder::new("llvm.extractvalue", self.loc)
+                    .add_operands(&[descriptor])
+                    .add_results(&[ty])
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "position"),
+                        DenseI64ArrayAttribute::new(self.ctx, position).into(),
+                    )])
+                    .build()
+                    .expect("failed to read memref descriptor field"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    fn emit_descriptor_insert(&mut self, descriptor: Value<'c, 'a>, value: Value<'c, 'a>, position: &[i64]) -> Value<'c, 'a> {
+        let descriptor_ty = descriptor.r#type();
+        self.block
+            .append_operation(
+                OperationBuilder::new("llvm.insertvalue", self.loc)
+                    .add_operands(&[descriptor, value])
+                    .add_results(&[descriptor_ty])
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "position"),
+                        DenseI64ArrayAttribute::new(self.ctx, position).into(),
+                    )])
+                    .build()
+                    .expect("failed to write memref descriptor field"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    fn emit_gep(&mut self, base: Value<'c, 'a>, offset: Value<'c, 'a>, elem: Type<'c>) -> Value<'c, 'a> {
+        self.block
+            .append_operation(
+                OperationBuilder::new("llvm.getelementptr", self.loc)
+                    .add_operands(&[base, offset])
+                    .add_results(&[melior::dialect::llvm::r#type::pointer(self.ctx, 0)])
+                    .add_attributes(&[
+                        (
+                            melior::ir::Identifier::new(self.ctx, "elem_type"),
+                            TypeAttribute::new(elem).into(),
+                        ),
+                        (
+                            melior::ir::Identifier::new(self.ctx, "rawConstantIndices"),
+                            DenseI32ArrayAttribute::new(self.ctx, &[i32::MIN]).into(),
+                        ),
+                    ])
+                    .build()
+                    .expect("failed to build llvm.getelementptr"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// `llvm.ptr` to byte offset `index` of a byte pointer. This is the lowered form
+    /// of a memref access; going through it directly lets a scalar load or store
+    /// carry `align 1`, which `memref.load` and `memref.store` cannot express.
+    fn emit_byte_address(&mut self, buf: Value<'c, 'a>, index: Value<'c, 'a>) -> Value<'c, 'a> {
+        let descriptor = self.emit_memref_descriptor(buf);
+        let aligned = self.emit_descriptor_field(descriptor, &[1], melior::dialect::llvm::r#type::pointer(self.ctx, 0));
+        let i64t: Type = IntegerType::new(self.ctx, 64).into();
+        let offset: Value = self
+            .block
+            .append_operation(arith::index_cast(index, i64t, self.loc))
+            .result(0)
+            .unwrap()
+            .into();
+        self.emit_gep(aligned, offset, IntegerType::new(self.ctx, 8).into())
+    }
+
+    /// A scalar load from a byte pointer, at any alignment.
+    fn emit_unaligned_load(&mut self, buf: Value<'c, 'a>, index: Value<'c, 'a>, scalar: ScalarType) -> Value<'c, 'a> {
+        let address = self.emit_byte_address(buf, index);
+        self.block
+            .append_operation(
+                OperationBuilder::new("llvm.load", self.loc)
+                    .add_operands(&[address])
+                    .add_results(&[scalar.to_mlir_type(self.ctx)])
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "alignment"),
+                        IntegerAttribute::new(IntegerType::new(self.ctx, 64).into(), 1).into(),
+                    )])
+                    .build()
+                    .expect("failed to build llvm.load"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// A scalar store to a byte pointer, at any alignment.
+    fn emit_unaligned_store(&mut self, val: Value<'c, 'a>, buf: Value<'c, 'a>, index: Value<'c, 'a>) {
+        let address = self.emit_byte_address(buf, index);
+        self.block.append_operation(
+            OperationBuilder::new("llvm.store", self.loc)
+                .add_operands(&[val, address])
+                .add_attributes(&[(
+                    melior::ir::Identifier::new(self.ctx, "alignment"),
+                    IntegerAttribute::new(IntegerType::new(self.ctx, 64).into(), 1).into(),
+                )])
+                .build()
+                .expect("failed to build llvm.store"),
+        );
+    }
+
+    /// `memref.load` of one element of the pointer's own type.
+    fn emit_memref_load(&mut self, buf: Value<'c, 'a>, index: Value<'c, 'a>, scalar: ScalarType) -> Value<'c, 'a> {
+        self.block
+            .append_operation(
+                OperationBuilder::new("memref.load", self.loc)
+                    .add_operands(&[buf, index])
+                    .add_results(&[scalar.to_mlir_type(self.ctx)])
+                    .build()
+                    .expect("failed to build memref.load"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    }
+
+    /// Store `val` at element index `index` of `buf`, reinterpreting it as the
+    /// pointer's element type when they differ (e.g. a `u64[1]` into a `ptr[u8]`).
+    fn emit_vector_store(
+        &mut self,
+        val: Value<'c, 'a>,
+        val_ty: VecType,
+        buf: Value<'c, 'a>,
+        buf_scalar: ScalarType,
+        index: Value<'c, 'a>,
+    ) {
+        // Scalars stay scalar (see emit_load).
+        if val_ty.width == 1 {
+            let same = buf_scalar.to_mlir_type(self.ctx) == val_ty.scalar.to_mlir_type(self.ctx);
+            if same {
+                self.block.append_operation(
+                    OperationBuilder::new("memref.store", self.loc)
+                        .add_operands(&[val, buf, index])
+                        .build()
+                        .expect("failed to build memref.store"),
+                );
+                return;
+            }
+            if buf_scalar.bit_width() == 8 {
+                self.emit_unaligned_store(val, buf, index);
+                return;
+            }
+        }
+        let as_vector: Value<'c, 'a> = if val_ty.width == 1 {
+            self.block
+                .append_operation(
+                    OperationBuilder::new("vector.broadcast", self.loc)
+                        .add_operands(&[val])
+                        .add_results(&[Type::vector(&[1], val_ty.scalar.to_mlir_type(self.ctx))])
+                        .build()
+                        .expect("failed to wrap scalar for store"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            val
+        };
+        let to_store: Value<'c, 'a> = if buf_scalar.to_mlir_type(self.ctx) != val_ty.scalar.to_mlir_type(self.ctx) {
+            let total_bits = val_ty.scalar.bit_width() as u64 * val_ty.width;
+            let elem_bits = buf_scalar.bit_width() as u64;
+            if total_bits % elem_bits != 0 {
+                self.error("store value size is not a multiple of the pointer's element size");
+            }
+            self.block
+                .append_operation(
+                    OperationBuilder::new("vector.bitcast", self.loc)
+                        .add_operands(&[as_vector])
+                        .add_results(&[Type::vector(&[total_bits / elem_bits], buf_scalar.to_mlir_type(self.ctx))])
+                        .build()
+                        .expect("failed to bitcast store value"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            as_vector
+        };
+        self.block.append_operation(
+            OperationBuilder::new("vector.store", self.loc)
+                .add_operands(&[to_store, buf, index])
+                .build()
+                .expect("failed to build vector.store"),
+        );
+    }
+
+    /// The element type of a pointer expression.
+    fn ptr_scalar_of(&self, ptr: &ast::Expr, fallback: ScalarType) -> ScalarType {
+        if let ast::Expr::Ident(name) = ptr {
+            if let Some(Binding::Ptr(_, s)) = self.vars.get(name) {
+                return *s;
+            }
+        }
+        fallback
     }
 
     fn emit_store(
@@ -1654,25 +1921,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         ptr: &ast::Expr,
         value: &ast::Expr,
     ) {
-        let (ptr_val, _) = self.emit_expr(ptr);
-        let (val, _) = self.emit_expr(value);
-
-        let index_type = Type::index(self.ctx);
-        let zero_index_attr = IntegerAttribute::new(index_type, 0);
-        let zero_index_op = arith::constant(self.ctx, zero_index_attr.into(), self.loc);
-        let zero_index = self
-            .block
-            .append_operation(zero_index_op)
-            .result(0)
-            .unwrap()
-            .into();
-
-        let store_op = OperationBuilder::new("vector.store", self.loc)
-            .add_operands(&[val, ptr_val, zero_index])
-            .build()
-            .expect("failed to build vector.store");
-
-        self.block.append_operation(store_op);
+        let (ptr_val, ptr_ty) = self.emit_expr(ptr);
+        let (val, val_ty) = self.emit_expr(value);
+        let buf_scalar = self.ptr_scalar_of(ptr, ptr_ty.scalar);
+        let zero_index = self.make_index_const(0);
+        self.emit_vector_store(val, val_ty, ptr_val, buf_scalar, zero_index);
     }
 
     fn emit_scatter(
@@ -1697,7 +1950,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             let mask_mlir = mask_ty.to_mlir_type(self.ctx);
             let scalar_type = ScalarType::Bool.to_mlir_type(self.ctx);
             let attr = IntegerAttribute::new(scalar_type, 1);
-            let splat = DenseElementsAttribute::new(mask_mlir, &[attr.into()])
+            let splat = splat_attr(mask_mlir, &[attr.into()])
                 .expect("failed to create all-true mask");
             let op = arith::constant(self.ctx, splat.into(), self.loc);
             self.block.append_operation(op).result(0).unwrap().into()
@@ -1777,6 +2030,15 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     width: ty.width,
                 };
                 let i32_mlir = i32_ty.to_mlir_type(self.ctx);
+                if ty.width == 1 {
+                    let widened = self
+                        .block
+                        .append_operation(arith::extui(val, i32_mlir, self.loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    return (widened, i32_ty);
+                }
 
                 // Zero-extend bool (i1) to i32
                 let ext_op = arith::extui(val, i32_mlir, self.loc);
@@ -1817,19 +2079,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     .into();
 
                 // Broadcast to width-1 vector
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-                let broadcast_op = OperationBuilder::new("vector.broadcast", self.loc)
-                    .add_operands(&[scalar_val])
-                    .add_results(&[result_mlir])
-                    .build()
-                    .expect("failed to build vector.broadcast");
-
-                let result = self
-                    .block
-                    .append_operation(broadcast_op)
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let result = scalar_val;
 
                 (result, result_ty)
             }
@@ -1866,7 +2116,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let values: Vec<melior::ir::attribute::Attribute> = (0..width as i64)
                     .map(|i| IntegerAttribute::new(i32_type, i).into())
                     .collect();
-                let dense = DenseElementsAttribute::new(vec_mlir, &values)
+                let dense = splat_attr(vec_mlir, &values)
                     .expect("failed to create iota dense attribute");
                 let op = arith::constant(self.ctx, dense.into(), self.loc);
                 let val = self.block.append_operation(op).result(0).unwrap().into();
@@ -1885,7 +2135,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     scalar: ty.scalar,
                     width: 1,
                 };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
+                if ty.width == 1 {
+                    return (val, result_ty);
+                }
 
                 // vector.extract to scalar
                 let extract_op = OperationBuilder::new("vector.extract", self.loc)
@@ -1900,12 +2152,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let scalar_val = self.block.append_operation(extract_op).result(0).unwrap().into();
 
                 // Broadcast scalar to width-1 vector
-                let broadcast_op = OperationBuilder::new("vector.broadcast", self.loc)
-                    .add_operands(&[scalar_val])
-                    .add_results(&[result_mlir])
-                    .build()
-                    .expect("failed to build vector.broadcast");
-                let result = self.block.append_operation(broadcast_op).result(0).unwrap().into();
+                let result = scalar_val;
                 (result, result_ty)
             }
             ast::Expr::Ident(name) if name == "compressstore" => {
@@ -1917,20 +2164,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let (mask_val, _) = self.emit_expr(&args[3].value);
 
                 // Convert offset from i32[1] to index scalar
-                let scalar_i32 = ScalarType::I32.to_mlir_type(self.ctx);
                 let index_type = Type::index(self.ctx);
 
                 // Extract scalar from i32[1]
-                let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                    .add_operands(&[offset_val])
-                    .add_results(&[scalar_i32])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .expect("failed to extract offset scalar");
-                let offset_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
+                let offset_scalar = offset_val;
 
                 // Cast i32 to index
                 let cast_op = arith::index_cast(offset_scalar, index_type, self.loc);
@@ -1953,20 +2190,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 assert_eq!(args.len(), 1, "to_i32 takes exactly 1 argument");
                 let (val, ty) = self.emit_expr(&args[0].value);
                 let result_ty = VecType { scalar: ScalarType::I32, width: ty.width };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-                let ext_op = arith::extui(val, result_mlir, self.loc);
-                let result = self.block.append_operation(ext_op).result(0).unwrap().into();
-                (result, result_ty)
+                (self.emit_int_resize(val, ty, result_ty), result_ty)
             }
             ast::Expr::Ident(name) if name == "to_i64" => {
                 // to_i64(vec) → zero-extend each lane to i64
                 assert_eq!(args.len(), 1, "to_i64 takes exactly 1 argument");
                 let (val, ty) = self.emit_expr(&args[0].value);
                 let result_ty = VecType { scalar: ScalarType::I64, width: ty.width };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-                let ext_op = arith::extui(val, result_mlir, self.loc);
-                let result = self.block.append_operation(ext_op).result(0).unwrap().into();
-                (result, result_ty)
+                (self.emit_int_resize(val, ty, result_ty), result_ty)
             }
             ast::Expr::Ident(name) if name == "to_bitmask" => {
                 // to_bitmask(bool[N]) → pack into u64[1], one bit per lane
@@ -1977,28 +2208,14 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 assert_eq!(ty.scalar, ScalarType::Bool, "to_bitmask requires bool vector");
                 let width = ty.width;
                 let i64_type: Type = IntegerType::new(self.ctx, 64).into();
-                let vec1xi64 = Type::vector(&[1], i64_type);
 
-                // Bitcast vector<Nxi1> → vector<1xiN>
+                // Bitcast vector<Nxi1> → iN directly. A vector<1xiN> intermediate gets
+                // legalized through a stack slot on AArch64.
                 let int_type: Type = IntegerType::new(self.ctx, width as u32).into();
-                let vec1xint = Type::vector(&[1], int_type);
-
-                let packed: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.bitcast", self.loc)
-                        .add_operands(&[val])
-                        .add_results(&[vec1xint])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
-
-                // Extract scalar, extend to i64
                 let scalar: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.extract", self.loc)
-                        .add_operands(&[packed])
+                    OperationBuilder::new("llvm.bitcast", self.loc)
+                        .add_operands(&[val])
                         .add_results(&[int_type])
-                        .add_attributes(&[(
-                            melior::ir::Identifier::new(self.ctx, "static_position"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                        )])
                         .build().unwrap()
                 ).result(0).unwrap().into();
 
@@ -2011,12 +2228,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 };
 
                 let result_ty = VecType { scalar: ScalarType::U64, width: 1 };
-                let result: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.broadcast", self.loc)
-                        .add_operands(&[scalar_i64])
-                        .add_results(&[vec1xi64])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let result: Value = scalar_i64;
 
                 (result, result_ty)
             }
@@ -2029,23 +2241,13 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     _ => panic!("from_bitmask width must be an integer literal"),
                 };
 
-                let i64_type: Type = IntegerType::new(self.ctx, 64).into();
                 let int_type: Type = IntegerType::new(self.ctx, target_width as u32).into();
                 let vec1xint = Type::vector(&[1], int_type);
                 let result_ty = VecType { scalar: ScalarType::Bool, width: target_width };
                 let result_mlir = result_ty.to_mlir_type(self.ctx);
 
                 // Extract i64 scalar
-                let scalar: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.extract", self.loc)
-                        .add_operands(&[val])
-                        .add_results(&[i64_type])
-                        .add_attributes(&[(
-                            melior::ir::Identifier::new(self.ctx, "static_position"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                        )])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let scalar: Value = val;
 
                 // Truncate to N bits if needed
                 let scalar_n = if target_width < 64 {
@@ -2099,31 +2301,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let i64_type: Type = IntegerType::new(self.ctx, 64).into();
                 let vec16xi8 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
                 let vec2xi64 = Type::vector(&[2], i64_type);
-                let vec1xi64 = Type::vector(&[1], i64_type);
                 let result_ty = VecType { scalar: ScalarType::U64, width: 1 };
 
                 // Extract scalars from u64[1]
-                let a_scalar: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.extract", self.loc)
-                        .add_operands(&[a_val])
-                        .add_results(&[i64_type])
-                        .add_attributes(&[(
-                            melior::ir::Identifier::new(self.ctx, "static_position"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                        )])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let a_scalar: Value = a_val;
 
-                let b_scalar: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.extract", self.loc)
-                        .add_operands(&[b_val])
-                        .add_results(&[i64_type])
-                        .add_attributes(&[(
-                            melior::ir::Identifier::new(self.ctx, "static_position"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                        )])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let b_scalar: Value = b_val;
 
                 // PMULL intrinsic
                 let seg_sizes = DenseI32ArrayAttribute::new(self.ctx, &[2, 0]);
@@ -2163,12 +2346,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 ).result(0).unwrap().into();
 
                 // Wrap in u64[1]
-                let result: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.broadcast", self.loc)
-                        .add_operands(&[lower])
-                        .add_results(&[vec1xi64])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let result: Value = lower;
 
                 (result, result_ty)
             }
@@ -2177,30 +2355,15 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 assert_eq!(args.len(), 1, "ctz takes exactly 1 argument");
                 let (val, _) = self.emit_expr(&args[0].value);
                 let i64_type: Type = IntegerType::new(self.ctx, 64).into();
-                let vec1xi64 = Type::vector(&[1], i64_type);
                 let result_ty = VecType { scalar: ScalarType::U64, width: 1 };
 
-                let scalar: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.extract", self.loc)
-                        .add_operands(&[val])
-                        .add_results(&[i64_type])
-                        .add_attributes(&[(
-                            melior::ir::Identifier::new(self.ctx, "static_position"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                        )])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let scalar: Value = val;
 
                 let ctz_result: Value = self.block.append_operation(
                     melior::dialect::llvm::intr_cttz(self.ctx, scalar, false, i64_type, self.loc)
                 ).result(0).unwrap().into();
 
-                let result: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.broadcast", self.loc)
-                        .add_operands(&[ctz_result])
-                        .add_results(&[vec1xi64])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let result: Value = ctz_result;
 
                 (result, result_ty)
             }
@@ -2210,11 +2373,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let (val, ty) = self.emit_expr(&args[0].value);
 
                 let i64_type: Type = IntegerType::new(self.ctx, 64).into();
-                let vec1xi64 = Type::vector(&[1], i64_type);
 
                 // x - 1
                 let one_attr = IntegerAttribute::new(i64_type, 1);
-                let one_splat = DenseElementsAttribute::new(vec1xi64, &[one_attr.into()]).unwrap();
+                let one_splat = one_attr;
                 let one_vec: Value = self.block.append_operation(
                     arith::constant(self.ctx, one_splat.into(), self.loc)
                 ).result(0).unwrap().into();
@@ -2242,7 +2404,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 // Helper to create a constant vector splat
                 let make_const = |cg: &mut Self, c: i64| -> Value<'c, 'a> {
                     let attr = IntegerAttribute::new(int_type, c);
-                    let splat = DenseElementsAttribute::new(vec_type, &[attr.into()]).unwrap();
+                    let splat = splat_attr(vec_type, &[attr.into()]).unwrap();
                     cg.block.append_operation(
                         arith::constant(cg.ctx, splat.into(), cg.loc)
                     ).result(0).unwrap().into()
@@ -2357,7 +2519,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                 let vec_type = ty.to_mlir_type(self.ctx);
                 let shift_attr = IntegerAttribute::new(scalar_type, shift_amount);
-                let shift_splat = DenseElementsAttribute::new(vec_type, &[shift_attr.into()]).unwrap();
+                let shift_splat = splat_attr(vec_type, &[shift_attr.into()]).unwrap();
                 let shift_vec: Value = self.block.append_operation(
                     arith::constant(self.ctx, shift_splat.into(), self.loc)
                 ).result(0).unwrap().into();
@@ -2377,7 +2539,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let scalar_type = ty.scalar.to_mlir_type(self.ctx);
                 let vec_type = ty.to_mlir_type(self.ctx);
                 let shift_attr = IntegerAttribute::new(scalar_type, shift_amount);
-                let shift_splat = DenseElementsAttribute::new(vec_type, &[shift_attr.into()]).unwrap();
+                let shift_splat = splat_attr(vec_type, &[shift_attr.into()]).unwrap();
                 let shift_vec: Value = self.block.append_operation(
                     arith::constant(self.ctx, shift_splat.into(), self.loc)
                 ).result(0).unwrap().into();
@@ -2538,14 +2700,239 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let result: Value = self.block.append_operation(shuffle_op).result(0).unwrap().into();
                 (result, result_ty)
             }
+            ast::Expr::Ident(name) if name == "unlikely" => {
+                // unlikely(bool[1]) → bool[1]: the same value, hinting that it is usually
+                // false so the true path is laid out away from the hot path.
+                assert_eq!(args.len(), 1, "unlikely takes exactly 1 argument");
+                let (val, ty) = self.emit_expr(&args[0].value);
+                if ty.scalar != ScalarType::Bool || ty.width != 1 {
+                    self.error("unlikely requires a scalar bool");
+                }
+                let i1: Type = IntegerType::new(self.ctx, 1).into();
+                let no: Value = self
+                    .block
+                    .append_operation(arith::constant(self.ctx, IntegerAttribute::new(i1, 0).into(), self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let hinted: Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("llvm.intr.expect", self.loc)
+                            .add_operands(&[val, no])
+                            .add_results(&[i1])
+                            .build()
+                            .expect("failed to build llvm.intr.expect"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (hinted, ty)
+            }
+            ast::Expr::Ident(name) if name == "to_u8" => {
+                // to_u8(vec) → truncate or pass through each lane to u8
+                assert_eq!(args.len(), 1, "to_u8 takes exactly 1 argument");
+                let (val, ty) = self.emit_expr(&args[0].value);
+                let result_ty = VecType { scalar: ScalarType::U8, width: ty.width };
+                (self.emit_int_resize(val, ty, result_ty), result_ty)
+            }
+            ast::Expr::Ident(name) if name == "min" || name == "max" => {
+                // min(a, b) / max(a, b) → lane-wise, honouring the operand's signedness
+                assert_eq!(args.len(), 2, "{} takes exactly 2 arguments", name);
+                let (a, a_ty) = self.emit_expr(&args[0].value);
+                let (b, b_ty) = if Self::is_literal(&args[1].value) {
+                    self.emit_literal_broadcast(&args[1].value, a_ty)
+                } else {
+                    self.emit_expr(&args[1].value)
+                };
+                if a_ty.width != b_ty.width {
+                    self.error(&format!("{} operands have different widths: {} vs {}", name, a_ty.width, b_ty.width));
+                }
+                let is_unsigned = matches!(
+                    a_ty.scalar,
+                    ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
+                );
+                let op_name = match (name.as_str(), a_ty.scalar.is_float(), is_unsigned) {
+                    ("min", true, _) => "arith.minimumf",
+                    ("max", true, _) => "arith.maximumf",
+                    ("min", false, true) => "arith.minui",
+                    ("max", false, true) => "arith.maxui",
+                    ("min", false, false) => "arith.minsi",
+                    ("max", false, false) => "arith.maxsi",
+                    _ => unreachable!(),
+                };
+                let result = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new(op_name, self.loc)
+                            .add_operands(&[a, b])
+                            .add_results(&[a_ty.to_mlir_type(self.ctx)])
+                            .build()
+                            .expect("failed to build lane-wise min/max"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (result, a_ty)
+            }
+            ast::Expr::Ident(name) if name == "mask8" => {
+                // mask8(bool[N]) → u8[N]: true lanes are 0xFF, false lanes 0x00.
+                assert_eq!(args.len(), 1, "mask8 takes exactly 1 argument");
+                let (val, ty) = self.emit_expr(&args[0].value);
+                if ty.scalar != ScalarType::Bool {
+                    self.error("mask8 requires a bool vector");
+                }
+                let result_ty = VecType { scalar: ScalarType::U8, width: ty.width };
+                let result_mlir = result_ty.to_mlir_type(self.ctx);
+                let result = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("arith.extsi", self.loc)
+                            .add_operands(&[val])
+                            .add_results(&[result_mlir])
+                            .build()
+                            .expect("failed to build arith.extsi"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (result, result_ty)
+            }
+            ast::Expr::Ident(name) if name == "nibblemask" => {
+                // nibblemask(u8[16]) → u64[1]: the high nibble of each lane, packed so
+                // lane i occupies bits 4i..4i+3 (NEON's cheap movemask: `shrn #4`).
+                assert_eq!(args.len(), 1, "nibblemask takes exactly 1 argument");
+                let (val, ty) = self.emit_expr(&args[0].value);
+                if ty.width != 16 || ty.scalar.bit_width() != 8 {
+                    self.error("nibblemask requires a u8[16]");
+                }
+                let i8t: Type = IntegerType::new(self.ctx, 8).into();
+                let i16t: Type = IntegerType::new(self.ctx, 16).into();
+                let i64t: Type = IntegerType::new(self.ctx, 64).into();
+                let v8i16 = Type::vector(&[8], i16t);
+                let v8i8 = Type::vector(&[8], i8t);
+                let v1i64 = Type::vector(&[1], i64t);
+                let as_i16: Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("vector.bitcast", self.loc)
+                            .add_operands(&[val])
+                            .add_results(&[v8i16])
+                            .build()
+                            .expect("failed to bitcast for nibblemask"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let four_attr = IntegerAttribute::new(i16t, 4);
+                let four: Value = self
+                    .block
+                    .append_operation(arith::constant(
+                        self.ctx,
+                        splat_attr(v8i16, &[four_attr.into()]).unwrap(),
+                        self.loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let shifted: Value = self
+                    .block
+                    .append_operation(arith::shrui(as_i16, four, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let narrowed: Value = self
+                    .block
+                    .append_operation(arith::trunci(shifted, v8i8, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let as_u64: Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("vector.bitcast", self.loc)
+                            .add_operands(&[narrowed])
+                            .add_results(&[v1i64])
+                            .build()
+                            .expect("failed to bitcast nibbles"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let result_ty = VecType { scalar: ScalarType::U64, width: 1 };
+                (self.emit_unwrap_unit(as_u64, result_ty), result_ty)
+            }
+            ast::Expr::Ident(name) if name == "concat" => {
+                // concat(a: T[N], b: T[N]) → T[2N]
+                assert_eq!(args.len(), 2, "concat takes exactly 2 arguments");
+                let (a, a_ty) = self.emit_expr(&args[0].value);
+                let (b, b_ty) = self.emit_expr(&args[1].value);
+                if a_ty.width != b_ty.width || a_ty.scalar.bit_width() != b_ty.scalar.bit_width() {
+                    self.error("concat requires operands of the same type");
+                }
+                if a_ty.width < 2 {
+                    self.error("concat requires vector operands");
+                }
+                let result_ty = VecType { scalar: a_ty.scalar, width: a_ty.width * 2 };
+                let mask: Vec<i64> = (0..result_ty.width as i64).collect();
+                let result = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("vector.shuffle", self.loc)
+                            .add_operands(&[a, b])
+                            .add_results(&[result_ty.to_mlir_type(self.ctx)])
+                            .add_attributes(&[(
+                                melior::ir::Identifier::new(self.ctx, "mask"),
+                                DenseI64ArrayAttribute::new(self.ctx, &mask).into(),
+                            )])
+                            .build()
+                            .expect("failed to build vector.shuffle for concat"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (result, result_ty)
+            }
+            ast::Expr::Ident(name) if name == "ptr_addr" => {
+                // ptr_addr(ptr) → i64[1]: the machine address of a pointer's first
+                // element, for alignment and page-boundary tests.
+                assert_eq!(args.len(), 1, "ptr_addr takes exactly 1 argument");
+                let (ptr_val, ptr_ty) = self.emit_expr(&args[0].value);
+                if ptr_ty.width != 0 {
+                    self.error("ptr_addr requires a pointer");
+                }
+                let index_type = Type::index(self.ctx);
+                let i64t: Type = IntegerType::new(self.ctx, 64).into();
+                let aligned: Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("memref.extract_aligned_pointer_as_index", self.loc)
+                            .add_operands(&[ptr_val])
+                            .add_results(&[index_type])
+                            .build()
+                            .expect("failed to extract pointer"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let addr: Value = self
+                    .block
+                    .append_operation(arith::index_cast(aligned, i64t, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                (addr, VecType { scalar: ScalarType::I64, width: 1 })
+            }
             ast::Expr::Ident(name) if name == "any" => {
                 // any(bool[N]) → bool[1], true if any lane is true
                 assert_eq!(args.len(), 1, "any takes exactly 1 argument");
                 let (val, ty) = self.emit_expr(&args[0].value);
                 assert_eq!(ty.scalar, ScalarType::Bool, "any requires bool vector");
+                if ty.width == 1 {
+                    return (val, ty);
+                }
                 let bool_type = ScalarType::Bool.to_mlir_type(self.ctx);
                 let result_ty = VecType { scalar: ScalarType::Bool, width: 1 };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
 
                 let kind_attr = melior::ir::attribute::Attribute::parse(
                     self.ctx, "#vector.kind<or>",
@@ -2561,12 +2948,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         .build().unwrap()
                 ).result(0).unwrap().into();
 
-                let result: Value = self.block.append_operation(
-                    OperationBuilder::new("vector.broadcast", self.loc)
-                        .add_operands(&[reduced])
-                        .add_results(&[result_mlir])
-                        .build().unwrap()
-                ).result(0).unwrap().into();
+                let result: Value = reduced;
                 (result, result_ty)
             }
             ast::Expr::Ident(name) if name == "gather" => {
@@ -2595,7 +2977,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let mask_mlir = mask_ty.to_mlir_type(self.ctx);
                 let bool_type = ScalarType::Bool.to_mlir_type(self.ctx);
                 let mask_attr = IntegerAttribute::new(bool_type, 1);
-                let mask_splat = DenseElementsAttribute::new(mask_mlir, &[mask_attr.into()])
+                let mask_splat = splat_attr(mask_mlir, &[mask_attr.into()])
                     .expect("failed to create all-true mask");
                 let mask_val = self.block
                     .append_operation(arith::constant(self.ctx, mask_splat.into(), self.loc))
@@ -2623,33 +3005,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             ast::Expr::Ident(name) if name == "store_at" => {
                 // store_at(buf, offset, data) → vector.store at index offset
                 assert_eq!(args.len(), 3, "store_at takes 3 arguments (buf, offset, data)");
-                let (buf_val, _) = self.emit_expr(&args[0].value);
-                let (offset_val, offset_ty) = self.emit_expr(&args[1].value);
-                let (data_val, _) = self.emit_expr(&args[2].value);
+                let (buf_val, buf_ty) = self.emit_expr(&args[0].value);
+                let offset_index = self.emit_index(&args[1].value);
+                let (data_val, data_ty) = self.emit_expr(&args[2].value);
+                let buf_scalar = self.ptr_scalar_of(&args[0].value, buf_ty.scalar);
 
-                // Convert offset to index
-                let offset_elem_ty = offset_ty.scalar.to_mlir_type(self.ctx);
-                let index_type = Type::index(self.ctx);
-
-                let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                    .add_operands(&[offset_val])
-                    .add_results(&[offset_elem_ty])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .expect("failed to extract offset scalar");
-                let offset_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
-
-                let cast_op = arith::index_cast(offset_scalar, index_type, self.loc);
-                let offset_index = self.block.append_operation(cast_op).result(0).unwrap().into();
-
-                let store_op = OperationBuilder::new("vector.store", self.loc)
-                    .add_operands(&[data_val, buf_val, offset_index])
-                    .build()
-                    .expect("failed to build vector.store");
-                self.block.append_operation(store_op);
+                self.emit_vector_store(data_val, data_ty, buf_val, buf_scalar, offset_index);
 
                 let dummy_ty = VecType { scalar: ScalarType::I32, width: 1 };
                 let dummy = self.emit_zero_vector(dummy_ty);
@@ -2670,80 +3031,43 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     ptr_dummy_ty.scalar
                 };
 
-                let (offset_val, offset_ty) = self.emit_expr(&args[1].value);
+                let offset_index = self.emit_index(&args[1].value);
+                let i64t: Type = IntegerType::new(self.ctx, 64).into();
+                let offset: Value = self
+                    .block
+                    .append_operation(arith::index_cast(offset_index, i64t, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
 
-                // Extract offset scalar from vector and cast to index
-                let offset_elem_ty = offset_ty.scalar.to_mlir_type(self.ctx);
-                let index_type = Type::index(self.ctx);
-
-                let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                    .add_operands(&[offset_val])
-                    .add_results(&[offset_elem_ty])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .expect("failed to extract ptr_add offset");
-                let offset_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
-
-                let cast_op = arith::index_cast(offset_scalar, index_type, self.loc);
-                let offset_index = self.block.append_operation(cast_op).result(0).unwrap().into();
-
-                // Compute remaining size: dim - offset
-                let zero_idx = self.make_index_const(0);
-                let dim_op = OperationBuilder::new("memref.dim", self.loc)
-                    .add_operands(&[ptr_val, zero_idx])
-                    .add_results(&[index_type])
-                    .build()
-                    .expect("failed to build memref.dim");
-                let dim_val = self.block.append_operation(dim_op).result(0).unwrap().into();
-
-                let remaining_op = arith::subi(dim_val, offset_index, self.loc);
-                let remaining = self.block.append_operation(remaining_op).result(0).unwrap().into();
-
-                // Build memref.reinterpret_cast with offset
-                let elem_mlir = elem_scalar.to_mlir_type(self.ctx);
-                // Result type needs strided layout with dynamic offset and stride
-                let layout = melior::ir::attribute::Attribute::parse(self.ctx,
-                    "affine_map<(d0)[s0, s1] -> (d0 * s1 + s0)>").unwrap();
-                let result_memref_type = MemRefType::new(elem_mlir, &[i64::MIN], Some(layout), None);
-                let one_idx = self.make_index_const(1);
-
-                let cast_op = OperationBuilder::new("memref.reinterpret_cast", self.loc)
-                    .add_operands(&[ptr_val, offset_index, remaining, one_idx])
-                    .add_results(&[result_memref_type.into()])
-                    .add_attributes(&[
-                        (
-                            melior::ir::Identifier::new(self.ctx, "operandSegmentSizes"),
-                            DenseI32ArrayAttribute::new(self.ctx, &[1, 1, 1, 1]).into(),
-                        ),
-                        (
-                            melior::ir::Identifier::new(self.ctx, "static_offsets"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[i64::MIN]).into(),
-                        ),
-                        (
-                            melior::ir::Identifier::new(self.ctx, "static_sizes"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[i64::MIN]).into(),
-                        ),
-                        (
-                            melior::ir::Identifier::new(self.ctx, "static_strides"),
-                            DenseI64ArrayAttribute::new(self.ctx, &[i64::MIN]).into(),
-                        ),
-                    ])
-                    .build()
-                    .expect("failed to build memref.reinterpret_cast for ptr_add");
-
-                let reinterp_result = self.block.append_operation(cast_op).result(0).unwrap().into();
-
-                // Cast back to plain memref<?xT> (drop the strided layout)
-                let plain_memref_type = MemRefType::new(elem_mlir, &[i64::MIN], None, None);
-                let memcast_op = OperationBuilder::new("memref.cast", self.loc)
-                    .add_operands(&[reinterp_result])
-                    .add_results(&[plain_memref_type.into()])
-                    .build()
-                    .expect("failed to build memref.cast for ptr_add");
-                let result = self.block.append_operation(memcast_op).result(0).unwrap().into();
+                // A plain `memref<?xT>` is defined to have offset 0, so advance the data
+                // pointer itself and keep the descriptor's offset field at 0. Loads, stores
+                // and ptr_addr then all see the same address.
+                let descriptor = self.emit_memref_descriptor(ptr_val);
+                let aligned = self.emit_descriptor_field(descriptor, &[1], melior::dialect::llvm::r#type::pointer(self.ctx, 0));
+                let advanced = self.emit_gep(aligned, offset, elem_scalar.to_mlir_type(self.ctx));
+                let size = self.emit_descriptor_field(descriptor, &[3, 0], i64t);
+                let remaining: Value = self
+                    .block
+                    .append_operation(arith::subi(size, offset, self.loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let with_ptr = self.emit_descriptor_insert(descriptor, advanced, &[1]);
+                let with_size = self.emit_descriptor_insert(with_ptr, remaining, &[3, 0]);
+                let plain_memref_type = MemRefType::new(elem_scalar.to_mlir_type(self.ctx), &[i64::MIN], None, None);
+                let result: Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                            .add_operands(&[with_size])
+                            .add_results(&[plain_memref_type.into()])
+                            .build()
+                            .expect("failed to cast descriptor to memref"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
 
                 (result, VecType { scalar: elem_scalar, width: 0 })
             }
@@ -2762,38 +3086,10 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     ptr_dummy_ty.scalar
                 };
 
-                let (offset_val, offset_ty) = self.emit_expr(&args[1].value);
-
-                // Convert offset from vector<1xi??> to index
-                let offset_elem_ty = offset_ty.scalar.to_mlir_type(self.ctx);
-                let index_type = Type::index(self.ctx);
-
-                // Extract scalar from vector
-                let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                    .add_operands(&[offset_val])
-                    .add_results(&[offset_elem_ty])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(self.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .expect("failed to extract load_at offset");
-                let offset_scalar = self.block.append_operation(extract_op).result(0).unwrap().into();
-
-                let cast_op = arith::index_cast(offset_scalar, index_type, self.loc);
-                let offset_index = self.block.append_operation(cast_op).result(0).unwrap().into();
+                let offset_index = self.emit_index(&args[1].value);
 
                 let result_ty = VecType { scalar: elem_scalar, width: 1 };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-
-                let load_op = OperationBuilder::new("vector.load", self.loc)
-                    .add_operands(&[ptr_val, offset_index])
-                    .add_results(&[result_mlir])
-                    .build()
-                    .expect("failed to build vector.load for load_at");
-
-                let result = self.block.append_operation(load_op).result(0).unwrap().into();
-                (result, result_ty)
+                (self.emit_memref_load(ptr_val, offset_index, elem_scalar), result_ty)
             }
             _ => {
                 // Inter-function call: look up user-defined function
@@ -2866,7 +3162,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     .add_results(&ret_mlir_types)
                     .add_attributes(&[(
                         melior::ir::Identifier::new(self.ctx, "callee"),
-                        melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, &target_name).into(),
+                        melior::ir::attribute::FlatSymbolRefAttribute::new(
+                            self.ctx,
+                            &if target_fn.extern_c { extern_impl_name(&target_name) } else { target_name.clone() },
+                        )
+                        .into(),
                     )])
                     .build()
                     .expect("failed to build func.call for inter-function call");
@@ -2913,6 +3213,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let chunk_vt = resolve_type(chunk_ty, &self.comptime_env, self.native_width);
         let chunk_mlir = chunk_vt.to_mlir_type(self.ctx);
         let chunk_width = chunk_vt.width;
+        if chunk_width < 2 {
+            self.error("stream chunk width must be at least 2 lanes");
+        }
 
         // Get the buffer memref value from vars
         let buf_binding = self
@@ -2982,7 +3285,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                     let scalar_type = carry_vt.scalar.to_mlir_type(self.ctx);
                     let vec_type = carry_vt.to_mlir_type(self.ctx);
                     let attr = IntegerAttribute::new(scalar_type, 1);
-                    let splat = DenseElementsAttribute::new(vec_type, &[attr.into()])
+                    let splat = splat_attr(vec_type, &[attr.into()])
                         .expect("failed to create all-ones splat");
                     self.block
                         .append_operation(arith::constant(self.ctx, splat.into(), self.loc))
@@ -3046,15 +3349,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             // Bind chunk_offset — the loop induction variable as i32[1]
             let i32_type = ScalarType::I32.to_mlir_type(self.ctx);
             let offset_i32_ty = VecType { scalar: ScalarType::I32, width: 1 };
-            let offset_mlir = offset_i32_ty.to_mlir_type(self.ctx);
             let cast_op = arith::index_cast(iv, i32_type, self.loc);
             let iv_i32 = inner_block.append_operation(cast_op).result(0).unwrap().into();
-            let bcast_op = OperationBuilder::new("vector.broadcast", self.loc)
-                .add_operands(&[iv_i32])
-                .add_results(&[offset_mlir])
-                .build()
-                .expect("failed to broadcast chunk_offset");
-            let iv_vec: Value = inner_block.append_operation(bcast_op).result(0).unwrap().into();
+            let iv_vec: Value = iv_i32;
             inner_cg.vars.insert("chunk_offset".to_string(), Binding::Vec(iv_vec, offset_i32_ty));
 
             // Bind carry variables from inner block args
@@ -3251,10 +3548,12 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         }
     }
 
-    /// Emit an if/else statement.
-    /// Variables assigned in both branches are visible after the if.
-    /// Currently uses a simple approach: emit both branches sequentially,
-    /// using arith.select to merge values assigned in both branches.
+    /// Emit an if/else statement as a real branch (`scf.if`).
+    ///
+    /// Only the taken branch runs, so stores and other side effects are conditional.
+    /// After the `if`, a variable holds its new value if either branch reassigned it.
+    /// A name first defined inside the `if` is visible afterwards only when both
+    /// branches define it. LLVM if-converts cheap pure branches back into `select`.
     fn emit_if(
         &mut self,
         cond_expr: &ast::Expr,
@@ -3262,79 +3561,118 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         else_body: &[ast::Stmt],
     ) {
         let (cond_val, cond_ty) = self.emit_expr(cond_expr);
-
-        // Condition must be bool[1] — extract the scalar
-        assert_eq!(
-            cond_ty.scalar,
-            ScalarType::Bool,
-            "if condition must be bool"
-        );
-        let cond_scalar = if cond_ty.width == 1 {
-            let bool_type = IntegerType::new(self.ctx, 1).into();
-            let extract_op = OperationBuilder::new("vector.extract", self.loc)
-                .add_operands(&[cond_val])
-                .add_results(&[bool_type])
-                .add_attributes(&[(
-                    melior::ir::Identifier::new(self.ctx, "static_position"),
-                    DenseI64ArrayAttribute::new(self.ctx, &[0]).into(),
-                )])
-                .build()
-                .expect("failed to extract bool scalar");
-            self.block
-                .append_operation(extract_op)
-                .result(0)
-                .unwrap()
-                .into()
-        } else {
+        if cond_ty.scalar != ScalarType::Bool {
+            self.error("if condition must be bool");
+        }
+        if cond_ty.width != 1 {
             self.error("if condition must be width 1 (scalar bool)");
-        };
-
-        // Snapshot vars before branches
-        let vars_before = self.vars.clone();
-
-        // Execute then branch
-        for stmt in then_body {
-            self.emit_stmt(stmt);
         }
-        let then_vars = self.vars.clone();
 
-        // Reset and execute else branch
-        self.vars = vars_before.clone();
-        for stmt in else_body {
-            self.emit_stmt(stmt);
-        }
-        let else_vars = self.vars.clone();
+        let then_block = Block::new(&[]);
+        let else_block = Block::new(&[]);
 
-        // Merge: for vars assigned in both branches, use arith.select
-        self.vars = vars_before.clone();
-        let mut all_keys: Vec<String> = then_vars.keys().chain(else_vars.keys()).cloned().collect();
-        all_keys.sort();
-        all_keys.dedup();
-
-        for key in &all_keys {
-            let in_before = vars_before.contains_key(key);
-            let in_then = then_vars.get(key);
-            let in_else = else_vars.get(key);
-
-            match (in_then, in_else) {
-                (Some(Binding::Vec(tv, tt)), Some(Binding::Vec(ev, _et))) => {
-                    // Both branches have this vec var — select between them
-                    let select_val: Value = self
-                        .block
-                        .append_operation(arith::select(cond_scalar, *tv, *ev, self.loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    self.vars.insert(key.clone(), Binding::Vec(select_val, *tt));
-                }
-                (Some(binding), _) if !in_before => {
-                    self.vars.insert(key.clone(), binding.clone());
-                }
-                (_, Some(binding)) if !in_before => {
-                    self.vars.insert(key.clone(), binding.clone());
-                }
-                _ => {}
+        let result_types: Vec<Type<'c>>;
+        let result_bindings: Vec<(String, Option<ScalarType>, Option<VecType>)>;
+        {
+            let new_inner = |this: &Self, block| FnCodegen {
+                ctx: this.ctx,
+                loc: this.loc,
+                block,
+                vars: this
+                    .vars
+                    .iter()
+                    // MLIR regions may use values from enclosing regions.
+                    .map(|(k, b)| (k.clone(), unsafe { std::mem::transmute(b.clone()) }))
+                    .collect(),
+                comptime_env: this.comptime_env.clone(),
+                native_width: this.native_width,
+                struct_defs: this.struct_defs.clone(),
+                fn_defs: this.fn_defs.clone(),
+                current_span: this.current_span,
+            };
+            let mut then_cg = new_inner(self, &then_block);
+            for stmt in then_body {
+                then_cg.emit_stmt(stmt);
             }
+            let mut else_cg = new_inner(self, &else_block);
+            for stmt in else_body {
+                else_cg.emit_stmt(stmt);
+            }
+
+            let mut names = Self::collect_assigned_vars(then_body);
+            names.extend(Self::collect_assigned_vars(else_body));
+            names.sort();
+            names.dedup();
+
+            let mut types = Vec::new();
+            let mut bindings = Vec::new();
+            let mut then_yield: Vec<Value> = Vec::new();
+            let mut else_yield: Vec<Value> = Vec::new();
+            for name in names {
+                match (then_cg.vars.get(&name), else_cg.vars.get(&name)) {
+                    (Some(Binding::Vec(tv, tt)), Some(Binding::Vec(ev, et))) => {
+                        if tt.to_mlir_type(self.ctx) != et.to_mlir_type(self.ctx) {
+                            self.error(&format!(
+                                "variable '{}' has different types in the two branches of an if: {:?}[{}] vs {:?}[{}]",
+                                name, tt.scalar, tt.width, et.scalar, et.width
+                            ));
+                        }
+                        types.push(tt.to_mlir_type(self.ctx));
+                        then_yield.push(*tv);
+                        else_yield.push(*ev);
+                        bindings.push((name, None, Some(*tt)));
+                    }
+                    (Some(Binding::Ptr(tv, ts)), Some(Binding::Ptr(ev, _))) => {
+                        let elem = ts.to_mlir_type(self.ctx);
+                        types.push(MemRefType::new(elem, &[i64::MIN], None, None).into());
+                        then_yield.push(*tv);
+                        else_yield.push(*ev);
+                        bindings.push((name, Some(*ts), None));
+                    }
+                    (Some(Binding::Struct { .. }), _) | (_, Some(Binding::Struct { .. })) => {
+                        self.error(&format!(
+                            "struct variable '{}' cannot be assigned inside an if",
+                            name
+                        ));
+                    }
+                    // Defined in only one branch: scoped to that branch.
+                    (Some(_), None) | (None, Some(_)) | (None, None) => {}
+                    (Some(_), Some(_)) => {
+                        self.error(&format!(
+                            "variable '{}' has different kinds in the two branches of an if",
+                            name
+                        ));
+                    }
+                }
+            }
+            then_block.append_operation(scf::r#yield(&then_yield, self.loc));
+            else_block.append_operation(scf::r#yield(&else_yield, self.loc));
+            result_types = types;
+            result_bindings = bindings;
+        }
+
+        let then_region = Region::new();
+        then_region.append_block(then_block);
+        let else_region = Region::new();
+        else_region.append_block(else_block);
+
+        let if_op = self.block.append_operation(
+            OperationBuilder::new("scf.if", self.loc)
+                .add_operands(&[cond_val])
+                .add_results(&result_types)
+                .add_regions([then_region, else_region])
+                .build()
+                .expect("failed to build scf.if"),
+        );
+
+        for (idx, (name, ptr_scalar, vec_ty)) in result_bindings.into_iter().enumerate() {
+            let result: Value<'c, 'a> = if_op.result(idx).unwrap().into();
+            let binding = match (ptr_scalar, vec_ty) {
+                (Some(s), _) => Binding::Ptr(result, s),
+                (_, Some(t)) => Binding::Vec(result, t),
+                _ => unreachable!(),
+            };
+            self.vars.insert(name, binding);
         }
     }
 
@@ -3418,8 +3756,6 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             }
         }
 
-        let i1_type: Type = IntegerType::new(self.ctx, 1).into();
-
         // === "before" region: evaluate condition, pass carried vars through ===
         let mut before_arg_types: Vec<(Type<'c>, Location<'c>)> = Vec::new();
         for t in &carried_mlir_types {
@@ -3461,22 +3797,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             let (cond_val, _) = before_cg.emit_expr(cond_expr);
 
             // Extract scalar bool
-            let cond_scalar: Value = {
-                let extract_op = OperationBuilder::new("vector.extract", before_cg.loc)
-                    .add_operands(&[cond_val])
-                    .add_results(&[i1_type])
-                    .add_attributes(&[(
-                        melior::ir::Identifier::new(before_cg.ctx, "static_position"),
-                        DenseI64ArrayAttribute::new(before_cg.ctx, &[0]).into(),
-                    )])
-                    .build()
-                    .expect("failed to extract while condition");
-                before_block
-                    .append_operation(extract_op)
-                    .result(0)
-                    .unwrap()
-                    .into()
-            };
+            let cond_scalar: Value = cond_val;
 
             // scf.condition %cond %args... : types
             // Pass through the block args as the values to forward to the "after" region
@@ -3689,6 +4010,36 @@ fn flatten_params<'c>(
 }
 
 /// Compile a single function definition to an MLIR func.func operation.
+/// Emit `memref.global "private" constant` for a const table.
+fn emit_const_global<'c>(ctx: &'c Context, def: &ast::ConstDef) -> Operation<'c> {
+    let loc = Location::unknown(ctx);
+    let scalar = ScalarType::from_name(&def.elem_type);
+    let elem = scalar.to_mlir_type(ctx);
+    let len = def.values.len() as i64;
+    let memref_ty = MemRefType::new(elem, &[len], None, None);
+    let elem_name = format!("i{}", scalar.bit_width());
+    let numbers: Vec<String> = def.values.iter().map(|v| v.to_string()).collect();
+    let dense = melior::ir::attribute::Attribute::parse(
+        ctx,
+        &format!("dense<[{}]> : tensor<{}x{}>", numbers.join(","), len, elem_name),
+    )
+    .unwrap_or_else(|| panic!("const '{}' has an invalid value", def.name));
+    OperationBuilder::new("memref.global", loc)
+        .add_attributes(&[
+            (melior::ir::Identifier::new(ctx, "sym_name"), StringAttribute::new(ctx, &def.name).into()),
+            (melior::ir::Identifier::new(ctx, "sym_visibility"), StringAttribute::new(ctx, "private").into()),
+            (melior::ir::Identifier::new(ctx, "type"), TypeAttribute::new(memref_ty.into()).into()),
+            (melior::ir::Identifier::new(ctx, "initial_value"), dense),
+            (melior::ir::Identifier::new(ctx, "constant"), melior::ir::attribute::Attribute::unit(ctx)),
+            (
+                melior::ir::Identifier::new(ctx, "alignment"),
+                IntegerAttribute::new(IntegerType::new(ctx, 64).into(), 64).into(),
+            ),
+        ])
+        .build()
+        .expect("failed to build memref.global")
+}
+
 pub fn emit_fn<'c>(
     ctx: &'c Context,
     fn_def: &ast::FnDef,
@@ -3696,6 +4047,7 @@ pub fn emit_fn<'c>(
     native_width: u64,
     struct_defs: &HashMap<String, ast::StructDef>,
     fn_defs: &HashMap<String, ast::FnDef>,
+    const_defs: &[ast::ConstDef],
 ) -> Operation<'c> {
     let loc = Location::unknown(ctx);
 
@@ -3733,6 +4085,39 @@ pub fn emit_fn<'c>(
         fn_defs: fn_defs.clone(),
         current_span: ast::Span::dummy(),
     };
+
+    // Const tables are pointers. A parameter of the same name shadows them.
+    for def in const_defs {
+        let scalar = ScalarType::from_name(&def.elem_type);
+        let elem = scalar.to_mlir_type(ctx);
+        let sized = MemRefType::new(elem, &[def.values.len() as i64], None, None);
+        let global: Value = block
+            .append_operation(
+                OperationBuilder::new("memref.get_global", loc)
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(ctx, "name"),
+                        melior::ir::attribute::FlatSymbolRefAttribute::new(ctx, &def.name).into(),
+                    )])
+                    .add_results(&[sized.into()])
+                    .build()
+                    .expect("failed to build memref.get_global"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let dynamic: Value = block
+            .append_operation(
+                OperationBuilder::new("memref.cast", loc)
+                    .add_operands(&[global])
+                    .add_results(&[MemRefType::new(elem, &[i64::MIN], None, None).into()])
+                    .build()
+                    .expect("failed to build memref.cast for const"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        cg.vars.insert(def.name.clone(), Binding::Ptr(dynamic, scalar));
+    }
 
     // Bind params to variable names
     // Group struct fields back into Binding::Struct
@@ -3844,10 +4229,175 @@ pub fn emit_fn<'c>(
     let region = Region::new();
     region.append_block(block);
 
+    let mut attributes: Vec<(melior::ir::Identifier<'c>, melior::ir::attribute::Attribute<'c>)> =
+        Vec::new();
+    if fn_def.noinline {
+        attributes.push((
+            melior::ir::Identifier::new(ctx, "no_inline"),
+            melior::ir::attribute::Attribute::unit(ctx),
+        ));
+    }
+    if fn_def.private {
+        attributes.push((
+            melior::ir::Identifier::new(ctx, "sym_visibility"),
+            StringAttribute::new(ctx, "private").into(),
+        ));
+        // MLIR's visibility stops at the func dialect; this is what reaches LLVM.
+        attributes.push((
+            melior::ir::Identifier::new(ctx, "llvm.linkage"),
+            melior::ir::attribute::Attribute::parse(ctx, "#llvm.linkage<internal>")
+                .expect("failed to parse linkage attribute"),
+        ));
+    }
+
+    let symbol = if fn_def.extern_c { extern_impl_name(&fn_def.name) } else { fn_def.name.clone() };
+    if fn_def.extern_c {
+        attributes.push((
+            melior::ir::Identifier::new(ctx, "sym_visibility"),
+            StringAttribute::new(ctx, "private").into(),
+        ));
+        attributes.push((
+            melior::ir::Identifier::new(ctx, "llvm.linkage"),
+            melior::ir::attribute::Attribute::parse(ctx, "#llvm.linkage<internal>")
+                .expect("failed to parse linkage attribute"),
+        ));
+    }
+
+    func::func(
+        ctx,
+        StringAttribute::new(ctx, &symbol),
+        TypeAttribute::new(func_type.into()),
+        region,
+        &attributes,
+        loc,
+    )
+}
+
+/// The symbol holding the body of an `extern fn`.
+fn extern_impl_name(name: &str) -> String {
+    format!("{}.impl", name)
+}
+
+/// The exported C-ABI entry of an `extern fn`: builds memref descriptors around its
+/// raw pointers and calls the body, which LLVM then inlines back into it.
+fn emit_extern_entry<'c>(
+    ctx: &'c Context,
+    fn_def: &ast::FnDef,
+    comptime_env: &HashMap<String, u64>,
+    native_width: u64,
+    struct_defs: &HashMap<String, ast::StructDef>,
+) -> Operation<'c> {
+    let loc = Location::unknown(ctx);
+    let ptr_ty: Type = melior::dialect::llvm::r#type::pointer(ctx, 0);
+    let i64t: Type = IntegerType::new(ctx, 64).into();
+    let descriptor_ty = Type::parse(ctx, "!llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>")
+        .expect("failed to parse memref descriptor type");
+
+    let flat = flatten_params(ctx, &fn_def.params, struct_defs, comptime_env, native_width);
+    let is_ptr: Vec<bool> = flat
+        .iter()
+        .map(|(name, _, _, _)| {
+            fn_def.params.iter().any(|p| &p.name == name && is_ptr_type_name(&p.ty.name))
+        })
+        .collect();
+    let entry_types: Vec<Type<'c>> = flat
+        .iter()
+        .zip(&is_ptr)
+        .map(|((_, t, _, _), is_ptr)| if *is_ptr { ptr_ty } else { *t })
+        .collect();
+    let impl_types: Vec<Type<'c>> = flat.iter().map(|(_, t, _, _)| *t).collect();
+    let ret_types: Vec<Type<'c>> = match &fn_def.ret_ty {
+        Some(ret) => resolve_struct_return_types(ctx, ret, struct_defs, comptime_env, native_width)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect(),
+        None => vec![],
+    };
+
+    let block_args: Vec<(Type<'c>, Location<'c>)> = entry_types.iter().map(|t| (*t, loc)).collect();
+    let block = Block::new(&block_args);
+
+    let constant = |value: i64| -> Value {
+        block
+            .append_operation(arith::constant(ctx, IntegerAttribute::new(i64t, value).into(), loc))
+            .result(0)
+            .unwrap()
+            .into()
+    };
+    let insert = |container: Value<'c, '_>, value: Value<'c, '_>, position: &[i64]| -> Value {
+        block
+            .append_operation(
+                OperationBuilder::new("llvm.insertvalue", loc)
+                    .add_operands(&[container, value])
+                    .add_results(&[descriptor_ty])
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(ctx, "position"),
+                        DenseI64ArrayAttribute::new(ctx, position).into(),
+                    )])
+                    .build()
+                    .expect("failed to build llvm.insertvalue"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
+
+    let mut call_args: Vec<Value> = Vec::new();
+    for (i, is_ptr) in is_ptr.iter().enumerate() {
+        let arg: Value = block.argument(i).unwrap().into();
+        if !*is_ptr {
+            call_args.push(arg);
+            continue;
+        }
+        let poison: Value = block
+            .append_operation(
+                OperationBuilder::new("llvm.mlir.poison", loc)
+                    .add_results(&[descriptor_ty])
+                    .build()
+                    .expect("failed to build llvm.mlir.poison"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let d = insert(poison, arg, &[0]);
+        let d = insert(d, arg, &[1]);
+        let d = insert(d, constant(0), &[2]);
+        let d = insert(d, constant(0), &[3, 0]);
+        let d = insert(d, constant(1), &[4, 0]);
+        let memref: Value = block
+            .append_operation(
+                OperationBuilder::new("builtin.unrealized_conversion_cast", loc)
+                    .add_operands(&[d])
+                    .add_results(&[impl_types[i]])
+                    .build()
+                    .expect("failed to cast descriptor to memref"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        call_args.push(memref);
+    }
+
+    let call = block.append_operation(
+        OperationBuilder::new("func.call", loc)
+            .add_operands(&call_args)
+            .add_results(&ret_types)
+            .add_attributes(&[(
+                melior::ir::Identifier::new(ctx, "callee"),
+                melior::ir::attribute::FlatSymbolRefAttribute::new(ctx, &extern_impl_name(&fn_def.name)).into(),
+            )])
+            .build()
+            .expect("failed to build call to extern fn body"),
+    );
+    let results: Vec<Value> = (0..ret_types.len()).map(|i| call.result(i).unwrap().into()).collect();
+    block.append_operation(func::r#return(&results, loc));
+
+    let region = Region::new();
+    region.append_block(block);
     func::func(
         ctx,
         StringAttribute::new(ctx, &fn_def.name),
-        TypeAttribute::new(func_type.into()),
+        TypeAttribute::new(FunctionType::new(ctx, &entry_types, &ret_types).into()),
         region,
         &[],
         loc,
@@ -3879,17 +4429,32 @@ pub fn compile_module<'c>(
         }
     }
 
+    let const_defs: Vec<ast::ConstDef> = items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Const(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    for def in &const_defs {
+        module.body().append_operation(emit_const_global(ctx, def));
+    }
+
     for item in items {
         match item {
             ast::Item::Fn(fn_def) => {
                 // Merge function-level comptime params with global env
                 let env = comptime_env.clone();
                 // For now, comptime params must be provided in the env
-                let op = emit_fn(ctx, fn_def, &env, native_width, &struct_defs, &fn_defs);
+                let op = emit_fn(ctx, fn_def, &env, native_width, &struct_defs, &fn_defs, &const_defs);
                 module.body().append_operation(op);
+                if fn_def.extern_c {
+                    let entry = emit_extern_entry(ctx, fn_def, &env, native_width, &struct_defs);
+                    module.body().append_operation(entry);
+                }
             }
-            ast::Item::Struct(_) => {
-                // Structs are erased — no codegen needed
+            ast::Item::Struct(_) | ast::Item::Const(_) => {
+                // Structs are erased; consts were emitted above
             }
         }
     }
@@ -4170,7 +4735,6 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "sum");
         unsafe {
-            // f32[1] = vector<1xf32> on ARM64 is returned in s0, so just f32
             let f: extern "C" fn(float32x4_t) -> f32 = std::mem::transmute(fptr);
             let a = vld1q_f32([1.0f32, 2.0, 3.0, 4.0].as_ptr());
             let result = f(a);
@@ -4685,12 +5249,11 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "count_matches");
         unsafe {
-            // u8[8] input = uint8x8_t, i32[1] = vector<1xi32> returned in s0 (NEON register)
             // Use f32 return to capture the value from s0, then transmute bits to i32
-            let f: extern "C" fn(uint8x8_t) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(uint8x8_t) -> i32 = std::mem::transmute(fptr);
             let chunk = vld1_u8([b'a', b'b', b'a', b'c', b'a', b'a', b'd', b'a'].as_ptr());
             let result_bits = f(chunk);
-            let result: i32 = f32::to_bits(result_bits) as i32;
+            let result: i32 = (result_bits) as i32;
             assert_eq!(result, 5); // 5 'a' characters
         }
     }
@@ -4800,11 +5363,10 @@ mod tests {
         let input: [u8; 4] = [b'a', b',', b'b', b','];
         unsafe {
             // memref<?xi8> passed as (ptr, ptr, i64, i64, i64)
-            // vector<1xi32> returned in s0 (NEON register), so use f32 and transmute
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 =
                 std::mem::transmute(fptr);
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 4, 1);
-            let result: i32 = f32::to_bits(result_bits) as i32;
+            let result: i32 = (result_bits) as i32;
             assert_eq!(result, 2, "should count 2 commas in first chunk");
         }
     }
@@ -4988,8 +5550,7 @@ mod tests {
         unsafe {
             // memref<?xi8> -> (ptr, ptr, i64, i64, i64)
             // vector<1xi32> returned in s0 (NEON register), so use f32 and transmute
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 =
-                std::mem::transmute(fptr);
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 = std::mem::transmute(fptr);
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 8, 1);
             let result: i32 = f32::to_bits(result_bits) as i32;
             assert_eq!(result, 3);
@@ -5012,11 +5573,10 @@ mod tests {
         let input: [u8; 8] = [b'a', b',', b'b', b',', b'c', b',', b'd', 0];
         unsafe {
             // memref<?xi8> -> (ptr, ptr, i64, i64, i64)
-            // vector<1xi32> returned in s0, use f32 and transmute
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 =
                 std::mem::transmute(fptr);
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 8, 1);
-            let result: i32 = f32::to_bits(result_bits) as i32;
+            let result: i32 = (result_bits) as i32;
             assert_eq!(result, 3, "should count 3 commas");
         }
     }
@@ -5038,11 +5598,10 @@ mod tests {
         let input: [u8; 8] = [b'a', b',', b'b', b',', b'c', b',', b'd', b'\0'];
         unsafe {
             // memref<?xi8> -> (ptr, ptr, i64, i64, i64)
-            // vector<1xi32> returned in s0, use f32 and transmute
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 =
                 std::mem::transmute(fptr);
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 8, 1);
-            let result: i32 = f32::to_bits(result_bits) as i32;
+            let result: i32 = (result_bits) as i32;
             assert_eq!(result, 3, "should count 3 commas");
         }
     }
@@ -5259,9 +5818,9 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "get_last");
         unsafe {
-            let f: extern "C" fn(int32x4_t) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(int32x4_t) -> i32 = std::mem::transmute(fptr);
             let v = vld1q_s32([10, 20, 30, 42].as_ptr());
-            let result = f32::to_bits(f(v)) as i32;
+            let result = (f(v)) as i32;
             assert_eq!(result, 42);
         }
     }
@@ -5286,9 +5845,9 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "seeded_xor");
         unsafe {
-            let f: extern "C" fn(int32x4_t, f32) -> int32x4_t = std::mem::transmute(fptr);
+            let f: extern "C" fn(int32x4_t, i32) -> int32x4_t = std::mem::transmute(fptr);
             let v = vld1q_s32([1, 0, 1, 0].as_ptr());
-            let seed: f32 = f32::from_bits(1u32); // i32 value 1 as f32 bits
+            let seed: i32 = (1u32) as i32; // i32 value 1 as f32 bits
             let result = f(v, seed);
             let mut out = [0i32; 4];
             vst1q_s32(out.as_mut_ptr(), result);
@@ -5417,18 +5976,17 @@ mod tests {
         let mut output = [0i32; 64]; // plenty of space for structural positions
 
         unsafe {
-            // json_stage1(input: memref<?xi8>, output: memref<?xi32>) -> vector<1xi32>
             // memref is (ptr, ptr, i64, i64, i64)
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,  // input memref
                 *mut i32, *mut i32, i64, i64, i64,     // output memref
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let result_bits = f(
                 input.as_ptr(), input.as_ptr(), 0, input.len() as i64, 1,
                 output.as_mut_ptr(), output.as_mut_ptr(), 0, output.len() as i64, 1,
             );
-            let num_structural = f32::to_bits(result_bits) as i32;
+            let num_structural = (result_bits) as i32;
 
             eprintln!("JSON: {:?}", std::str::from_utf8(&json[..24]).unwrap());
             eprintln!("num_structural = {}", num_structural);
@@ -5556,13 +6114,13 @@ mod tests {
             let f1: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr1);
+            ) -> i32 = std::mem::transmute(fptr1);
 
             let bits = f1(
                 input.as_ptr(), input.as_ptr(), 0, input.len() as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, 64, 1,
             );
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
 
             eprintln!("\n=== Full JSON Pipeline ===");
             eprintln!("Input: {:?}", std::str::from_utf8(&json[..28]).unwrap());
@@ -5713,13 +6271,13 @@ mod tests {
             let f1: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr1);
+            ) -> i32 = std::mem::transmute(fptr1);
 
             let bits = f1(
                 input.as_ptr(), input.as_ptr(), 0, input.len() as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, 64, 1,
             );
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
 
             // Pad positions
             let padded = ((num as usize + 7) / 8) * 8;
@@ -5867,12 +6425,12 @@ mod tests {
             let f1: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr1);
+            ) -> i32 = std::mem::transmute(fptr1);
             let bits = f1(
                 json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, 128, 1,
             );
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
             let padded = ((num as usize + 7) / 8) * 8;
             for i in num as usize..padded { positions[i] = 0; }
 
@@ -6063,55 +6621,55 @@ mod tests {
         unsafe {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,  // input memref
-                f32,                                     // start_pos as i32[1] in s0
-            ) -> f32 = std::mem::transmute(fptr);
+                i32,                                     // start_pos as i32[1] in s0
+            ) -> i32 = std::mem::transmute(fptr);
 
             // "42" starts at position 8
-            let pos = f32::from_bits(8u32);
+            let pos = (8u32) as i32;
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 32, 1, pos);
-            let result = f32::to_bits(result_bits) as i32;
+            let result = (result_bits) as i32;
             eprintln!("parse_int('42' at pos 8) = {}", result);
             assert_eq!(result, 42);
 
             // Test "1234" at position 0
             let input2 = b"1234____\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos2 = f32::from_bits(0u32);
-            let r2 = f32::to_bits(f(input2.as_ptr(), input2.as_ptr(), 0, 24, 1, pos2)) as i32;
+            let pos2 = (0u32) as i32;
+            let r2 = (f(input2.as_ptr(), input2.as_ptr(), 0, 24, 1, pos2)) as i32;
             eprintln!("parse_int('1234' at pos 0) = {}", r2);
             assert_eq!(r2, 1234);
 
             // Test "7" at position 0
             let input3 = b"7,next\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos3 = f32::from_bits(0u32);
-            let r3 = f32::to_bits(f(input3.as_ptr(), input3.as_ptr(), 0, 24, 1, pos3)) as i32;
+            let pos3 = (0u32) as i32;
+            let r3 = (f(input3.as_ptr(), input3.as_ptr(), 0, 24, 1, pos3)) as i32;
             eprintln!("parse_int('7' at pos 0) = {}", r3);
             assert_eq!(r3, 7);
 
             // Test negative: "-42"
             let input4 = b"-42,next\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos4 = f32::from_bits(0u32);
-            let r4 = f32::to_bits(f(input4.as_ptr(), input4.as_ptr(), 0, 24, 1, pos4)) as i32;
+            let pos4 = (0u32) as i32;
+            let r4 = (f(input4.as_ptr(), input4.as_ptr(), 0, 24, 1, pos4)) as i32;
             eprintln!("parse_int('-42' at pos 0) = {}", r4);
             assert_eq!(r4, -42);
 
             // Test large number: "12345678"
             let input5 = b"12345678\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos5 = f32::from_bits(0u32);
-            let r5 = f32::to_bits(f(input5.as_ptr(), input5.as_ptr(), 0, 24, 1, pos5)) as i32;
+            let pos5 = (0u32) as i32;
+            let r5 = (f(input5.as_ptr(), input5.as_ptr(), 0, 24, 1, pos5)) as i32;
             eprintln!("parse_int('12345678' at pos 0) = {}", r5);
             assert_eq!(r5, 12345678);
 
             // Test single digit negative: "-5"
             let input6 = b"-5,next\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos6 = f32::from_bits(0u32);
-            let r6 = f32::to_bits(f(input6.as_ptr(), input6.as_ptr(), 0, 24, 1, pos6)) as i32;
+            let pos6 = (0u32) as i32;
+            let r6 = (f(input6.as_ptr(), input6.as_ptr(), 0, 24, 1, pos6)) as i32;
             eprintln!("parse_int('-5' at pos 0) = {}", r6);
             assert_eq!(r6, -5);
 
             // Test 5-digit number: "99999"
             let input7 = b"99999,next\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let pos7 = f32::from_bits(0u32);
-            let r7 = f32::to_bits(f(input7.as_ptr(), input7.as_ptr(), 0, 24, 1, pos7)) as i32;
+            let pos7 = (0u32) as i32;
+            let r7 = (f(input7.as_ptr(), input7.as_ptr(), 0, 24, 1, pos7)) as i32;
             eprintln!("parse_int('99999' at pos 0) = {}", r7);
             assert_eq!(r7, 99999);
         }
@@ -6305,8 +6863,8 @@ mod tests {
             let stage1: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(f1);
-            let num = f32::to_bits(stage1(
+            ) -> i32 = std::mem::transmute(f1);
+            let num = (stage1(
                 json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, 256, 1,
             )) as i32;
@@ -6365,8 +6923,8 @@ mod tests {
             // ---- Integer parser ----
             let parse_int: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
-                f32,
-            ) -> f32 = std::mem::transmute(fpi);
+                i32,
+            ) -> i32 = std::mem::transmute(fpi);
 
             // ---- Print full parse output ----
             let type_names = [
@@ -6428,8 +6986,8 @@ mod tests {
                         }
                         6 => { // val:num — use val_starts for whitespace-skipped position
                             let num_pos = val_starts[i] as usize;
-                            let pos_bits = f32::from_bits(num_pos as u32);
-                            let val = f32::to_bits(parse_int(
+                            let pos_bits = (num_pos as u32) as i32;
+                            let val = (parse_int(
                                 json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
                                 pos_bits,
                             )) as i32;
@@ -6464,18 +7022,18 @@ mod tests {
                     let key = get_string(positions[i - 1] as usize);
                     if key == "age" {
                         let num_pos = val_starts[i] as usize;
-                        let val = f32::to_bits(parse_int(
+                        let val = (parse_int(
                             json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                            f32::from_bits(num_pos as u32),
+                            (num_pos as u32) as i32,
                         )) as i32;
                         eprintln!("  json[\"age\"] = {}", val);
                         assert_eq!(val, 30);
                     }
                     if key == "balance" {
                         let num_pos = val_starts[i] as usize;
-                        let val = f32::to_bits(parse_int(
+                        let val = (parse_int(
                             json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                            f32::from_bits(num_pos as u32),
+                            (num_pos as u32) as i32,
                         )) as i32;
                         eprintln!("  json[\"balance\"] = {}", val);
                         assert_eq!(val, -1500);
@@ -6513,9 +7071,9 @@ mod tests {
                             let mut elem_idx = 0;
                             // First element: right after '[', use val_starts of the open bracket
                             let np0 = val_starts[open_idx] as usize;
-                            let v0 = f32::to_bits(parse_int(
+                            let v0 = (parse_int(
                                 json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                                f32::from_bits(np0 as u32),
+                                (np0 as u32) as i32,
                             )) as i32;
                             eprintln!("    scores[{}] = {}", elem_idx, v0);
                             elem_idx += 1;
@@ -6523,9 +7081,9 @@ mod tests {
                             for j in (open_idx + 1)..close_idx {
                                 if types[j] == 6 { // val:num (comma before number)
                                     let np = val_starts[j] as usize;
-                                    let v = f32::to_bits(parse_int(
+                                    let v = (parse_int(
                                         json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                                        f32::from_bits(np as u32),
+                                        (np as u32) as i32,
                                     )) as i32;
                                     eprintln!("    scores[{}] = {}", elem_idx, v);
                                     elem_idx += 1;
@@ -6544,18 +7102,18 @@ mod tests {
                                     let inner_key = get_string(positions[j - 1] as usize);
                                     if inner_key == "id" && types[j] == 6 {
                                         let np = val_starts[j] as usize;
-                                        let v = f32::to_bits(parse_int(
+                                        let v = (parse_int(
                                             json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                                            f32::from_bits(np as u32),
+                                            (np as u32) as i32,
                                         )) as i32;
                                         eprintln!("  json[\"meta\"][\"id\"] = {}", v);
                                         assert_eq!(v, 12345678);
                                     }
                                     if inner_key == "ver" && types[j] == 6 {
                                         let np = val_starts[j] as usize;
-                                        let v = f32::to_bits(parse_int(
+                                        let v = (parse_int(
                                             json.as_ptr(), json.as_ptr(), 0, json.len() as i64, 1,
-                                            f32::from_bits(np as u32),
+                                            (np as u32) as i32,
                                         )) as i32;
                                         eprintln!("  json[\"meta\"][\"ver\"] = {}", v);
                                         assert_eq!(v, -3);
@@ -6717,8 +7275,8 @@ mod tests {
         let mut partners = vec![-1i32; n];
 
         unsafe {
-            let st1: extern "C" fn(*const u8,*const u8,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) -> f32 = std::mem::transmute(f1);
-            let num = f32::to_bits(st1(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,positions.as_mut_ptr(),positions.as_mut_ptr(),0,n as i64,1)) as i32;
+            let st1: extern "C" fn(*const u8,*const u8,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) -> i32 = std::mem::transmute(f1);
+            let num = (st1(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,positions.as_mut_ptr(),positions.as_mut_ptr(),0,n as i64,1)) as i32;
             let padded = ((num as usize+7)/8)*8;
             for i in num as usize..padded { positions[i]=0; }
 
@@ -6744,8 +7302,8 @@ mod tests {
             }
 
             let parse_i = |pos: usize| -> i32 {
-                let fpi_fn: extern "C" fn(*const u8,*const u8,i64,i64,i64,f32) -> f32 = std::mem::transmute(fpi);
-                f32::to_bits(fpi_fn(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,f32::from_bits(pos as u32))) as i32
+                let fpi_fn: extern "C" fn(*const u8,*const u8,i64,i64,i64,i32) -> i32 = std::mem::transmute(fpi);
+                (fpi_fn(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,(pos as u32) as i32)) as i32
             };
 
             let get_str = |pos: usize| -> &str {
@@ -6899,7 +7457,7 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             // Warmup
             let _ = f(
@@ -6916,7 +7474,7 @@ mod tests {
                     json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                     positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1,
                 );
-                total_structural = f32::to_bits(bits) as i32;
+                total_structural = (bits) as i32;
             }
             let elapsed = start.elapsed();
 
@@ -6984,7 +7542,7 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let _ = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
@@ -6995,7 +7553,7 @@ mod tests {
             for _ in 0..iterations {
                 let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                     positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-                total_structural = f32::to_bits(bits) as i32;
+                total_structural = (bits) as i32;
             }
             let elapsed = start.elapsed();
             let total_bytes = json_len as f64 * iterations as f64;
@@ -7056,7 +7614,7 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let _ = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
@@ -7067,7 +7625,7 @@ mod tests {
             for _ in 0..iterations {
                 let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                     positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-                total_structural = f32::to_bits(bits) as i32;
+                total_structural = (bits) as i32;
             }
             let elapsed = start.elapsed();
             let total_bytes = json_len as f64 * iterations as f64;
@@ -7128,7 +7686,7 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let _ = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
@@ -7139,7 +7697,7 @@ mod tests {
             for _ in 0..iterations {
                 let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                     positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-                total_structural = f32::to_bits(bits) as i32;
+                total_structural = (bits) as i32;
             }
             let elapsed = start.elapsed();
             let total_bytes = json_len as f64 * iterations as f64;
@@ -7252,13 +7810,13 @@ mod tests {
         eprintln!("Input size: {:.2} MB", json_len as f64 / 1e6);
 
         unsafe {
-            let st1: extern "C" fn(*const u8,*const u8,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) -> f32 = std::mem::transmute(f1);
+            let st1: extern "C" fn(*const u8,*const u8,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) -> i32 = std::mem::transmute(f1);
             let st2d: extern "C" fn(*const u8,*const u8,i64,i64,i64,*const i32,*const i32,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) = std::mem::transmute(f2d);
             let st2t: extern "C" fn(*const u8,*const u8,i64,i64,i64,*const i32,*const i32,i64,i64,i64,*mut i32,*mut i32,i64,i64,i64) = std::mem::transmute(f2t);
 
             // Warmup
             let bits = st1(json.as_ptr(),json.as_ptr(),0,padded_len as i64,1,positions.as_mut_ptr(),positions.as_mut_ptr(),0,max_s as i64,1);
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
             let spad = ((num as usize+7)/8)*8;
             for i in num as usize..spad { positions[i]=0; }
             st2d(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,positions.as_ptr(),positions.as_ptr(),0,spad as i64,1,depths.as_mut_ptr(),depths.as_mut_ptr(),0,max_s as i64,1);
@@ -7268,7 +7826,7 @@ mod tests {
             let start = std::time::Instant::now();
             for _ in 0..iterations {
                 let bits = st1(json.as_ptr(),json.as_ptr(),0,padded_len as i64,1,positions.as_mut_ptr(),positions.as_mut_ptr(),0,max_s as i64,1);
-                let num = f32::to_bits(bits) as i32;
+                let num = (bits) as i32;
                 let spad = ((num as usize+7)/8)*8;
                 for i in num as usize..spad { positions[i]=0; }
                 st2d(json.as_ptr(),json.as_ptr(),0,json.len() as i64,1,positions.as_ptr(),positions.as_ptr(),0,spad as i64,1,depths.as_mut_ptr(),depths.as_mut_ptr(),0,max_s as i64,1);
@@ -7301,9 +7859,9 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup_opt(source, "test_bitmask", 2);
         unsafe {
-            let f: extern "C" fn(uint8x8_t) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(uint8x8_t) -> i32 = std::mem::transmute(fptr);
             let v = vld1_u8([b'a', b'b', b'a', b'a', b'b', b'b', b'a', b'b'].as_ptr());
-            let result = f32::to_bits(f(v)) as i32;
+            let result = (f(v)) as i32;
             assert_eq!(result, 4, "should count 4 'a' chars");
         }
     }
@@ -7336,10 +7894,10 @@ mod tests {
         "#;
         let (fptr2, _engine2) = jit_lookup_opt(source2, "test_clmul2", 2);
         unsafe {
-            let f: extern "C" fn(uint8x8_t) -> f32 = std::mem::transmute(fptr2);
+            let f: extern "C" fn(uint8x8_t) -> i32 = std::mem::transmute(fptr2);
             // Input: x " h e l " x x → in_str = [0,1,1,1,1,0,0,0] → 4 true
             let v = vld1_u8([b'x', b'"', b'h', b'e', b'l', b'"', b'x', b'x'].as_ptr());
-            let result = f32::to_bits(f(v)) as i32;
+            let result = (f(v)) as i32;
             assert_eq!(result, 4, "4 bytes should be inside string");
         }
     }
@@ -7415,11 +7973,11 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
             eprintln!("Structural chars: {}", num);
 
             let iterations = 10;
@@ -7511,12 +8069,12 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             // Warmup + verify
             let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
             eprintln!("Structural chars: {}", num);
 
             // Verify correctness against vector version
@@ -7627,11 +8185,11 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let bits = f(json.as_ptr(), json.as_ptr(), 0, padded_len as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, max_structural as i64, 1);
-            let num = f32::to_bits(bits) as i32;
+            let num = (bits) as i32;
             eprintln!("Structural chars: {}", num);
 
             let iterations = 10;
@@ -7712,24 +8270,24 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup_opt(source, "validate_utf8", 2);
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 = std::mem::transmute(fptr);
 
             // Valid ASCII
             let valid_ascii = b"Hello, world!!\0\0";
-            let errors = f32::to_bits(f(valid_ascii.as_ptr(), valid_ascii.as_ptr(), 0, 16, 1)) as i32;
+            let errors = (f(valid_ascii.as_ptr(), valid_ascii.as_ptr(), 0, 16, 1)) as i32;
             eprintln!("Valid ASCII errors: {}", errors);
             assert_eq!(errors, 0, "Valid ASCII should have 0 errors");
 
             // Valid UTF-8: "café" = [99, 97, 102, 195, 169] (é is 0xC3 0xA9)
             let valid_utf8 = b"caf\xC3\xA9_______\0\0\0\0";
             let padded_len = 16;
-            let errors = f32::to_bits(f(valid_utf8.as_ptr(), valid_utf8.as_ptr(), 0, padded_len as i64, 1)) as i32;
+            let errors = (f(valid_utf8.as_ptr(), valid_utf8.as_ptr(), 0, padded_len as i64, 1)) as i32;
             eprintln!("Valid UTF-8 errors: {}", errors);
             assert_eq!(errors, 0, "Valid UTF-8 should have 0 errors");
 
             // Invalid: bare continuation byte (0x80 without a starter)
             let invalid = b"\x80Hello_________\0";
-            let errors = f32::to_bits(f(invalid.as_ptr(), invalid.as_ptr(), 0, 16, 1)) as i32;
+            let errors = (f(invalid.as_ptr(), invalid.as_ptr(), 0, 16, 1)) as i32;
             eprintln!("Invalid (bare continuation) errors: {}", errors);
             assert!(errors > 0, "Bare continuation byte should be an error");
         }
@@ -7750,16 +8308,16 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup_opt(source, "has_escapes", 2);
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 = std::mem::transmute(fptr);
 
             // No escapes
             let clean = b"Hello, world!!!!\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let n = f32::to_bits(f(clean.as_ptr(), clean.as_ptr(), 0, 32, 1)) as i32;
+            let n = (f(clean.as_ptr(), clean.as_ptr(), 0, 32, 1)) as i32;
             assert_eq!(n, 0, "Clean string should have 0 backslashes");
 
             // Has escapes
             let escaped = b"Hello\\nWorld\\t!!\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let n = f32::to_bits(f(escaped.as_ptr(), escaped.as_ptr(), 0, 32, 1)) as i32;
+            let n = (f(escaped.as_ptr(), escaped.as_ptr(), 0, 32, 1)) as i32;
             assert_eq!(n, 2, "Should find 2 backslashes");
         }
     }
@@ -7784,16 +8342,16 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup_opt(source, "count_number_bytes", 2);
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 = std::mem::transmute(fptr);
 
             // "3.14" has 4 number bytes
             let input = b"3.14____________\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let n = f32::to_bits(f(input.as_ptr(), input.as_ptr(), 0, 32, 1)) as i32;
+            let n = (f(input.as_ptr(), input.as_ptr(), 0, 32, 1)) as i32;
             assert_eq!(n, 4, "3.14 has 4 number bytes");
 
             // "-1.5e10" has 7 number bytes
             let input2 = b"-1.5e10_________\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let n2 = f32::to_bits(f(input2.as_ptr(), input2.as_ptr(), 0, 32, 1)) as i32;
+            let n2 = (f(input2.as_ptr(), input2.as_ptr(), 0, 32, 1)) as i32;
             assert_eq!(n2, 7, "-1.5e10 has 7 number bytes");
         }
     }
@@ -7812,9 +8370,9 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup_opt(source, "count_whitespace", 2);
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 = std::mem::transmute(fptr);
             let input = b"  hello  world  \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-            let n = f32::to_bits(f(input.as_ptr(), input.as_ptr(), 0, 32, 1)) as i32;
+            let n = (f(input.as_ptr(), input.as_ptr(), 0, 32, 1)) as i32;
             assert_eq!(n, 6, "Should count 6 whitespace chars");
         }
     }
@@ -8223,9 +8781,9 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "all_ones");
         unsafe {
-            let f: extern "C" fn() -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn() -> i32 = std::mem::transmute(fptr);
             let bits = f();
-            let result = f32::to_bits(bits) as u64;
+            let result = (bits) as u64;
             // u64[1] all-ones = 0xFFFFFFFFFFFFFFFF, but returned as i32 via f32 reinterpret
             // The low 32 bits should be all-ones
             assert_eq!(result as u32, 0xFFFFFFFF);
@@ -8347,14 +8905,14 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
             let input = b"aababcaa\0\0\0\0\0\0\0\0";
             let mut count_out = [0i32; 1];
             let sum_bits = f(
                 input.as_ptr(), input.as_ptr(), 0, 16, 1,
                 count_out.as_mut_ptr(), count_out.as_mut_ptr(), 0, 1, 1,
             );
-            let sum = f32::to_bits(sum_bits) as i32;
+            let sum = (sum_bits) as i32;
             eprintln!("count={}, sum={}", count_out[0], sum);
             assert_eq!(count_out[0], 5, "should count 5 'a' bytes");
             assert!(sum > 0, "sum should be positive");
@@ -8381,20 +8939,20 @@ mod tests {
         "#;
         let (fptr, _engine) = jit_lookup(source, "pick");
         unsafe {
-            let f: extern "C" fn(f32, int32x4_t, int32x4_t) -> int32x4_t =
+            let f: extern "C" fn(i32, int32x4_t, int32x4_t) -> int32x4_t =
                 std::mem::transmute(fptr);
             let a = vld1q_s32([1i32, 2, 3, 4].as_ptr());
             let b = vld1q_s32([10i32, 20, 30, 40].as_ptr());
 
             // flag=1 → cond=true → return a
-            let result = f(f32::from_bits(1u32), a, b);
+            let result = f((1u32) as i32, a, b);
             let mut out = [0i32; 4];
             vst1q_s32(out.as_mut_ptr(), result);
             eprintln!("flag=1 result: {:?}", out);
             assert_eq!(out, [1, 2, 3, 4]);
 
             // flag=0 → cond=false → return b
-            let result = f(f32::from_bits(0u32), a, b);
+            let result = f((0u32) as i32, a, b);
             vst1q_s32(out.as_mut_ptr(), result);
             eprintln!("flag=0 result: {:?}", out);
             assert_eq!(out, [10, 20, 30, 40]);
@@ -8419,13 +8977,13 @@ mod tests {
             let f: extern "C" fn(
                 *const u8, *const u8, i64, i64, i64,
                 *mut i32, *mut i32, i64, i64, i64,
-            ) -> f32 = std::mem::transmute(fptr);
+            ) -> i32 = std::mem::transmute(fptr);
 
             let bits = f(
                 padded.as_ptr(), padded.as_ptr(), 0, padded.len() as i64, 1,
                 positions.as_mut_ptr(), positions.as_mut_ptr(), 0, positions.len() as i64, 1,
             );
-            let num = f32::to_bits(bits) as usize;
+            let num = (bits) as usize;
             let doc = crate::json::build_tape(&padded, &positions[..num]);
             (doc, padded)
         }
@@ -8657,8 +9215,8 @@ mod tests {
                 let f: extern "C" fn(
                     *const u8, *const u8, i64, i64, i64,
                     *mut i32, *mut i32, i64, i64, i64,
-                ) -> f32 = std::mem::transmute(fptr);
-                f32::to_bits(f(
+                ) -> i32 = std::mem::transmute(fptr);
+                (f(
                     input.as_ptr(), input.as_ptr(), 0, input.len() as i64, 1,
                     positions.as_mut_ptr(), positions.as_mut_ptr(), 0, positions.len() as i64, 1,
                 )) as usize
@@ -8747,12 +9305,11 @@ mod tests {
 
         unsafe {
             // count_segments(buf: ptr[u8], buf_len: i32[1]) -> i32[1]
-            // ptr = 5 values, i32[1] = f32 (in NEON register)
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64, f32) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64, i32) -> i32 =
                 std::mem::transmute(fptr);
-            let buf_len = f32::from_bits(33u32);
+            let buf_len = (33u32) as i32;
             let result_bits = f(buf.as_ptr(), buf.as_ptr(), 0, 33, 1, buf_len);
-            let result = f32::to_bits(result_bits) as i32;
+            let result = (result_bits) as i32;
             assert_eq!(result, 2, "should find 2 HEAP_DUMP_SEGMENT records (tag=0x1C)");
         }
     }
@@ -8768,12 +9325,12 @@ mod tests {
         let (fptr, _engine) = jit_lookup(source, "read_byte");
         let input: [u8; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64, f32) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64, i32) -> i32 =
                 std::mem::transmute(fptr);
             // Read byte at offset 3 (should be 40)
-            let offset_bits = f32::from_bits(3u32);
+            let offset_bits = (3u32) as i32;
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 8, 1, offset_bits);
-            let result = f32::to_bits(result_bits) as i32;
+            let result = (result_bits) as i32;
             assert_eq!(result, 40, "load_at(buf, 3) should read byte 40");
         }
     }
@@ -8835,10 +9392,10 @@ mod tests {
         let (fptr, _engine) = jit_lookup(source, "main");
         let input: [u8; 4] = [42, 0, 0, 0];
         unsafe {
-            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> f32 =
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i32 =
                 std::mem::transmute(fptr);
             let result_bits = f(input.as_ptr(), input.as_ptr(), 0, 4, 1);
-            let result = f32::to_bits(result_bits) as i32;
+            let result = (result_bits) as i32;
             assert_eq!(result, 42);
         }
     }
@@ -8866,9 +9423,9 @@ mod tests {
         let engine = melior::ExecutionEngine::new(&module, 0, &[], false);
         let fptr = engine.lookup("count_tens");
         unsafe {
-            let f: extern "C" fn(f32) -> f32 = std::mem::transmute(fptr);
-            let input = f32::from_bits(45u32);
-            let result = f32::to_bits(f(input)) as i32;
+            let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fptr);
+            let input = (45u32) as i32;
+            let result = (f(input)) as i32;
             assert_eq!(result, 4, "should count 4 tens in 45");
         }
     }
@@ -8904,11 +9461,476 @@ mod extra_tests {
         let engine = melior::ExecutionEngine::new(&module, 0, &[], false);
         let fptr = engine.lookup("test");
         unsafe {
-            let f: extern "C" fn(f32) -> f32 = std::mem::transmute(fptr);
+            let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fptr);
             // count how many i in [0,10) are > 5: that's 6,7,8,9 = 4
-            let input = f32::from_bits(10u32);
-            let result = f32::to_bits(f(input)) as i32;
+            let input = (10u32) as i32;
+            let result = (f(input)) as i32;
             assert_eq!(result, 4, "should count 4 values > 5 in range [0,10)");
         }
+    }
+}
+
+// ============================================================
+// Scalars, real branches, and the features the escape kernel needs
+// ============================================================
+#[cfg(test)]
+mod scalar_and_branch_tests {
+    use super::*;
+    use crate::parser;
+    use crate::typecheck;
+
+    /// JIT a program and hand the function pointer, with the engine that owns it, to `body`.
+    fn with_fn<R>(source: &str, name: &str, body: impl FnOnce(*mut ()) -> R) -> R {
+        let ctx = create_context();
+        let items = parser::parse(source);
+        typecheck::typecheck(&items, &HashMap::new(), 8)
+            .unwrap_or_else(|e| panic!("type errors: {:?}", e.iter().map(|x| x.to_string()).collect::<Vec<_>>()));
+        let mut module = compile_module(&ctx, &items, &HashMap::new(), 8);
+        assert!(module.as_operation().verify(), "MLIR verify failed:\n{}", module.as_operation());
+        lower_to_llvm(&ctx, &mut module).unwrap();
+        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let fptr = engine.lookup(name);
+        assert!(!fptr.is_null(), "{} not found", name);
+        body(fptr)
+    }
+
+    fn type_errors(source: &str) -> Vec<String> {
+        let items = parser::parse(source);
+        match typecheck::typecheck(&items, &HashMap::new(), 8) {
+            Ok(()) => vec![],
+            Err(errors) => errors.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    type Ptr5 = (*mut u8, *mut u8, i64, i64, i64);
+    fn desc(buf: &mut [u8]) -> Ptr5 {
+        (buf.as_mut_ptr(), buf.as_mut_ptr(), 0, buf.len() as i64, 1)
+    }
+
+    #[test]
+    fn scalars_are_returned_in_full_64_bits() {
+        with_fn("fn f(x: i64[1]) -> i64[1] { return x + 1 }", "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(0x1234_5678_9ABC_DEF0), 0x1234_5678_9ABC_DEF1);
+        });
+    }
+
+    #[test]
+    fn if_runs_only_the_taken_branch() {
+        let source = r#"
+            fn f(flag: i32[1], buf: ptr[u8]) {
+                seven: u8[1] = 7
+                nine: u8[1] = 9
+                if flag > 0 {
+                    store_at(buf, 0, seven)
+                } else {
+                    store_at(buf, 1, nine)
+                }
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i32, *mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [0u8; 2];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(1, a, b, c, d, e);
+            assert_eq!(buf, [7, 0], "true branch must not run the else store");
+            let mut buf = [0u8; 2];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(0, a, b, c, d, e);
+            assert_eq!(buf, [0, 9], "false branch must not run the then store");
+        });
+    }
+
+    #[test]
+    fn if_merges_values_from_either_branch() {
+        let source = r#"
+            fn f(x: i64[1]) -> i64[1] {
+                a: i64[1] = 1
+                b: i64[1] = 2
+                if x > 0 {
+                    a = a + 10
+                    both = x
+                } else {
+                    b = b + 20
+                    both = x + x
+                }
+                return a * 10000 + b * 100 + both
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(5), 11 * 10000 + 2 * 100 + 5);
+            assert_eq!(f(-3), 10000 + 22 * 100 - 6);
+        });
+    }
+
+    #[test]
+    fn if_nested_inside_while_carries_state() {
+        let source = r#"
+            fn f(n: i64[1]) -> i64[1] {
+                i: i64[1] = 0
+                sum: i64[1] = 0
+                while i < n {
+                    if (i & 1) == 0 {
+                        sum = sum + i
+                    }
+                    i = i + 1
+                }
+                return sum
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(7), 0 + 2 + 4 + 6);
+        });
+    }
+
+    #[test]
+    fn name_from_one_branch_is_not_visible_after_the_if() {
+        let errors = type_errors(
+            r#"
+            fn f(x: i64[1]) -> i64[1] {
+                if x > 0 {
+                    only_then = x
+                } else {
+                    other = x
+                }
+                return only_then
+            }
+        "#,
+        );
+        assert!(errors.iter().any(|e| e.contains("only_then")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn name_from_both_branches_is_visible_after_the_if() {
+        let errors = type_errors(
+            r#"
+            fn f(x: i64[1]) -> i64[1] {
+                if x > 0 { y = x } else { y = x + 1 }
+                return y
+            }
+        "#,
+        );
+        assert!(errors.is_empty(), "got {:?}", errors);
+    }
+
+    #[test]
+    fn branches_must_agree_on_width() {
+        let errors = type_errors(
+            r#"
+            fn f(x: i64[1], v: i64[2]) -> i64[1] {
+                if x > 0 { y = x } else { y = v }
+                return x
+            }
+        "#,
+        );
+        assert!(errors.iter().any(|e| e.contains("'y'")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn return_inside_a_branch_or_loop_is_rejected() {
+        for body in ["if x > 0 { return x }", "while x > 0 { return x }"] {
+            let errors = type_errors(&format!("fn f(x: i64[1]) -> i64[1] {{ {} return x }}", body));
+            assert!(errors.iter().any(|e| e.contains("return")), "{}: got {:?}", body, errors);
+        }
+    }
+
+    #[test]
+    fn const_tables_are_pointers() {
+        let source = r#"
+            const TABLE = [u8: 10, 20, 30, 40]
+            fn f(i: i64[1]) -> u8[1] { return load_at(TABLE, i) }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> u8 = std::mem::transmute(p);
+            assert_eq!([f(0), f(3)], [10, 40]);
+        });
+    }
+
+    #[test]
+    fn wide_scalars_load_and_store_at_any_byte_offset() {
+        let source = r#"
+            fn f(buf: ptr[u8], from: i64[1], to: i64[1]) -> u64[1] {
+                x = load_at[u64[1]](buf, from)
+                store_at(buf, to, x)
+                return x
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            let mut buf: Vec<u8> = (1..=32).collect();
+            let (a, b, c, d, e) = desc(&mut buf);
+            let got = f(a, b, c, d, e, 3, 17);
+            assert_eq!(got, u64::from_le_bytes([4, 5, 6, 7, 8, 9, 10, 11]));
+            assert_eq!(&buf[17..25], &[4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(buf[16], 17, "byte before the store is untouched");
+            assert_eq!(buf[25], 26, "byte after the store is untouched");
+        });
+    }
+
+    #[test]
+    fn shift_amounts_can_be_values() {
+        with_fn("fn f(x: u64[1], s: u64[1]) -> u64[1] { return (x << s) >> 1 }", "f", |p| unsafe {
+            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(3, 4), 24);
+        });
+        let source = r#"
+            fn f(buf: ptr[u8], s: u8[1]) {
+                v = load_at[u8[16]](buf, 0)
+                store_at(buf, 0, v >> s)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64, u8) = std::mem::transmute(p);
+            let mut buf = [0x80u8; 16];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e, 3);
+            assert_eq!(buf, [0x10u8; 16]);
+        });
+        let errors = type_errors("fn f(x: u64[2], s: u64[4]) -> u64[2] { return x << s }");
+        assert!(errors.iter().any(|e| e.contains("shift amount")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn lane_min_max_respect_signedness() {
+        let source = r#"
+            fn f(buf: ptr[u8]) {
+                u = load_at[u8[16]](buf, 0)
+                i = load_at[i8[16]](buf, 0)
+                ones = [u8: 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]
+                store_at(buf, 16, min(u, ones))
+                store_at(buf, 32, max(u, ones))
+                store_at(buf, 48, min(i, 100))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf = [200u8; 64];
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(buf[16], 100, "unsigned min(200, 100)");
+            assert_eq!(buf[32], 200, "unsigned max(200, 100)");
+            assert_eq!(buf[48], 200, "signed min(-56, 100) is -56, byte 200");
+        });
+    }
+
+    #[test]
+    fn bitmask_builtins() {
+        let source = r#"
+            fn bits(buf: ptr[u8]) -> u64[1] { return to_bitmask(load_at[u8[16]](buf, 0) > 127) }
+            fn nibbles(buf: ptr[u8]) -> u64[1] { return nibblemask(mask8(load_at[u8[16]](buf, 0) > 127)) }
+            fn low(x: u64[1]) -> u64[1] { return ctz(x) }
+            fn clear(x: u64[1]) -> u64[1] { return clear_lowest_bit(x) }
+        "#;
+        let mut input = [0u8; 16];
+        input[0] = 255;
+        input[3] = 128;
+        input[15] = 200;
+        with_fn(source, "bits", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            let mut copy = input;
+            let (a, b, c, d, e) = desc(&mut copy);
+            assert_eq!(f(a, b, c, d, e), 0b1000_0000_0000_1001);
+        });
+        with_fn(source, "nibbles", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            let mut copy = input;
+            let (a, b, c, d, e) = desc(&mut copy);
+            assert_eq!(f(a, b, c, d, e), 0xF000_0000_0000_F00F);
+        });
+        with_fn(source, "low", |p| unsafe {
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(0b1000), 3);
+        });
+        with_fn(source, "clear", |p| unsafe {
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(0b1100), 0b1000);
+        });
+    }
+
+    #[test]
+    fn concat_joins_halves() {
+        let source = r#"
+            fn f(buf: ptr[u8]) {
+                v = load_at[u8[16]](buf, 0)
+                store_at(buf, 16, concat(split_hi(v), split_lo(v)))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            let mut buf: Vec<u8> = (0..32).collect();
+            let (a, b, c, d, e) = desc(&mut buf);
+            f(a, b, c, d, e);
+            assert_eq!(&buf[16..24], &[8, 9, 10, 11, 12, 13, 14, 15]);
+            assert_eq!(&buf[24..32], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        });
+    }
+
+    #[test]
+    fn ptr_addr_is_the_machine_address() {
+        let source = r#"
+            fn base(buf: ptr[u8]) -> i64[1] { return ptr_addr(buf) }
+            fn advanced(buf: ptr[u8]) -> i64[1] {
+                five: i64[1] = 5
+                p = ptr_add(buf, five)
+                return ptr_addr(p)
+            }
+        "#;
+        let mut buf = [0u8; 16];
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "base", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), b as i64);
+        });
+        with_fn(source, "advanced", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), b as i64 + 5);
+        });
+    }
+
+    #[test]
+    fn ptr_add_applies_to_every_kind_of_access() {
+        let source = r#"
+            fn vector(buf: ptr[u8]) -> u8[1] {
+                five: i64[1] = 5
+                p = ptr_add(buf, five)
+                return extract(load_at[u8[16]](p, 1), 0)
+            }
+            fn scalar(buf: ptr[u8]) -> u8[1] {
+                five: i64[1] = 5
+                p = ptr_add(buf, five)
+                return load_at(p, 1)
+            }
+            fn wide(buf: ptr[u8]) -> u64[1] {
+                five: i64[1] = 5
+                p = ptr_add(buf, five)
+                return load_at[u64[1]](p, 1)
+            }
+            fn writes(buf: ptr[u8]) {
+                five: i64[1] = 5
+                p = ptr_add(buf, five)
+                seven: u8[1] = 7
+                store_at(p, 1, seven)
+            }
+            fn streamed(buf: ptr[u8]) -> i32[1] {
+                sixteen: i64[1] = 16
+                p = ptr_add(buf, sixteen)
+                stream chunk: u8[16] over p carry (first: i32[1] = 0) {
+                    carry first = to_i32(extract(chunk, 0))
+                }
+                return first
+            }
+        "#;
+        let mut buf: Vec<u8> = (0..48).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "vector", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 6);
+        });
+        with_fn(source, "scalar", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 6);
+        });
+        with_fn(source, "wide", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), u64::from_le_bytes([6, 7, 8, 9, 10, 11, 12, 13]));
+        });
+        with_fn(source, "streamed", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> i32 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 32, "stream sees the remaining size");
+        });
+        with_fn(source, "writes", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) = std::mem::transmute(p);
+            f(a, b, c, d, e);
+        });
+        assert_eq!(buf[6], 7);
+    }
+
+    #[test]
+    fn unlikely_passes_its_value_through() {
+        let source = r#"
+            fn f(x: i64[1]) -> i64[1] {
+                if unlikely(x > 0) { y = x } else { y = 0 - x }
+                return y
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!([f(4), f(-4)], [4, 4]);
+        });
+    }
+
+    #[test]
+    fn extern_fn_takes_plain_pointers() {
+        let source = r#"
+            extern fn sum2(buf: ptr[u8], i: i64[1]) -> i64[1] {
+                return to_i64(load_at(buf, i)) + to_i64(load_at(buf, i + 1))
+            }
+            fn caller(buf: ptr[u8]) -> i64[1] {
+                zero: i64[1] = 0
+                return sum2(buf, zero)
+            }
+        "#;
+        let buf = [3u8, 4, 5];
+        with_fn(source, "sum2", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(buf.as_ptr(), 1), 9);
+        });
+        with_fn(source, "caller", |p| unsafe {
+            let f: extern "C" fn(*const u8, *const u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(buf.as_ptr(), buf.as_ptr(), 0, 3, 1), 7);
+        });
+    }
+
+    #[test]
+    fn extern_fn_cannot_stream_over_its_pointers() {
+        let errors = type_errors(
+            r#"
+            extern fn f(buf: ptr[u8]) -> i32[1] {
+                stream chunk: u8[16] over buf carry (n: i32[1] = 0) {
+                    carry n = n + 1
+                }
+                return n
+            }
+        "#,
+        );
+        assert!(errors.iter().any(|e| e.contains("no known size")), "got {:?}", errors);
+    }
+
+    #[test]
+    fn private_and_noinline_functions_stay_callable() {
+        let source = r#"
+            private fn double(x: i64[1]) -> i64[1] { return x + x }
+            noinline private fn triple(x: i64[1]) -> i64[1] { return x + x + x }
+            fn f(x: i64[1]) -> i64[1] { return double(x) + triple(x) }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(2), 10);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "both private and extern")]
+    fn private_extern_is_rejected() {
+        parser::parse("private extern fn f(x: i64[1]) -> i64[1] { return x }");
+    }
+
+    #[test]
+    fn memory_offsets_must_be_scalar_integers() {
+        // A literal offset is fine without an annotation.
+        let source = r#"
+            fn f(buf: ptr[u8]) -> u8[1] {
+                v = load_at[u8[16]](buf, 2)
+                return extract(v, 0)
+            }
+        "#;
+        let mut buf: Vec<u8> = (0..32).collect();
+        let (a, b, c, d, e) = desc(&mut buf);
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*mut u8, *mut u8, i64, i64, i64) -> u8 = std::mem::transmute(p);
+            assert_eq!(f(a, b, c, d, e), 2);
+        });
     }
 }

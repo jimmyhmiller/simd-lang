@@ -8,6 +8,10 @@ pub enum Token {
 
     // Keywords
     Struct,
+    Const,
+    NoInline,
+    Private,
+    Extern,
     Fn,
     Return,
     Let,
@@ -157,6 +161,10 @@ impl<'a> Lexer<'a> {
 
         match text {
             "struct" => Token::Struct,
+            "const" => Token::Const,
+            "noinline" => Token::NoInline,
+            "private" => Token::Private,
+            "extern" => Token::Extern,
             "fn" => Token::Fn,
             "return" => Token::Return,
             "let" => Token::Let,
