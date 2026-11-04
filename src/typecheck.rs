@@ -262,6 +262,46 @@ struct FnSig {
     ret_ty: Option<CheckedType>,
 }
 
+thread_local! {
+    /// Set while trying widths on a generic nothing calls, where a panic just means that width
+    /// doesn't work, so the panic hook shouldn't report it as an error.
+    static TRYING_WIDTHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a panic right now is an expected part of trying widths.
+pub fn trying_widths() -> bool {
+    TRYING_WIDTHS.with(|flag| flag.get())
+}
+
+/// Widths for a generic nothing calls: every power of two up to the widest register, for each
+/// parameter. With more than two parameters, all of them take the same width, to keep the
+/// number of tries small.
+fn widths_to_try(def: &ast::FnDef, module_env: &HashMap<String, u64>) -> Vec<HashMap<String, u64>> {
+    const WIDTHS: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
+    let params: Vec<&String> = def
+        .comptime_params
+        .iter()
+        .map(|c| &c.name)
+        .filter(|name| !module_env.contains_key(*name))
+        .collect();
+    let with = |bindings: &[(&String, u64)]| {
+        let mut env = module_env.clone();
+        env.extend(bindings.iter().map(|(name, width)| ((*name).clone(), *width)));
+        env
+    };
+    match params.as_slice() {
+        [a, b] => WIDTHS
+            .iter()
+            .flat_map(|x| WIDTHS.iter().map(move |y| (*x, *y)))
+            .map(|(x, y)| with(&[(a, x), (b, y)]))
+            .collect(),
+        _ => WIDTHS
+            .iter()
+            .map(|w| with(&params.iter().map(|name| (*name, *w)).collect::<Vec<_>>()))
+            .collect(),
+    }
+}
+
 struct TypeChecker {
     arch: Arch,
     /// Functions with comptime parameters the environment doesn't bind. Their bodies
@@ -643,6 +683,9 @@ impl TypeChecker {
                     }
                 }
             }
+            ast::StmtKind::RangeStream(_) => {
+                panic!("at {}: internal error: a range stream reached the type checker unexpanded", stmt.span);
+            }
             ast::StmtKind::Stream {
                 chunk_name,
                 chunk_ty,
@@ -823,6 +866,9 @@ impl TypeChecker {
             ast::Expr::BoolLit(_) => CheckedType::Literal(LitKind::Bool),
             ast::Expr::CharLit(_) => CheckedType::Literal(LitKind::Char),
 
+            ast::Expr::VecComp(_) | ast::Expr::Index { .. } | ast::Expr::SubSlice { .. } => {
+                unreachable!("comprehensions and indexing are resolved after parsing")
+            }
             ast::Expr::VecLit { elem_type, values } => {
                 let scalar = ScalarType::from_name(elem_type);
                 CheckedType::Vec(VecType {
@@ -1550,7 +1596,7 @@ impl TypeChecker {
                 let mty = self.infer_arg(args, 0);
                 let widths: &[u64] = match self.arch {
                     Arch::Aarch64 => &[16],
-                    Arch::X86_64 => &[16, 32, 64],
+                    Arch::X86_64(_) => &[16, 32, 64],
                 };
                 if !matches!(&mty, CheckedType::Vec(vt) if vt.scalar == ScalarType::Bool && widths.contains(&vt.width)) {
                     self.err(format!("any_in_first needs a bool vector of one register, got {}", mty.describe()));
@@ -1815,24 +1861,7 @@ impl TypeChecker {
         bindings.sort();
         let key = format!("{}[{}]", name, bindings.join(","));
         if self.checked_instances.insert(key) {
-            let saved_vars = std::mem::take(&mut self.vars);
-            let saved_ret = self.ret_ty.take();
-            self.instance_depth += 1;
-            let saved_span = self.current_span;
-            let saved_env = std::mem::replace(&mut self.comptime_env, env.clone());
-            let widths: HashMap<String, u64> = def
-                .comptime_params
-                .iter()
-                .map(|c| (c.name.clone(), env[&c.name]))
-                .collect();
-            let mut instance = def.clone();
-            crate::comptime::substitute_in_fn(&mut instance, &widths);
-            self.check_fn(&instance);
-            self.vars = saved_vars;
-            self.ret_ty = saved_ret;
-            self.instance_depth -= 1;
-            self.current_span = saved_span;
-            self.comptime_env = saved_env;
+            self.check_instance(&def, &env);
         }
 
         match &def.ret_ty {
@@ -1845,6 +1874,87 @@ impl TypeChecker {
                 CheckedType::Vec(resolve_type(ret, &env, self.native_width))
             }
             Some(ret) => self.struct_type_of(ret, &env),
+        }
+    }
+
+    /// Check a generic function's body at one set of widths.
+    fn check_instance(&mut self, def: &ast::FnDef, env: &HashMap<String, u64>) {
+        let saved_vars = std::mem::take(&mut self.vars);
+        let saved_ret = self.ret_ty.take();
+        self.instance_depth += 1;
+        let saved_span = self.current_span;
+        let saved_env = std::mem::replace(&mut self.comptime_env, env.clone());
+        let widths: HashMap<String, u64> = def
+            .comptime_params
+            .iter()
+            .map(|c| (c.name.clone(), env[&c.name]))
+            .collect();
+        let mut instance = def.clone();
+        crate::comptime::substitute_in_fn(&mut instance, &widths);
+        self.check_fn(&instance);
+        self.vars = saved_vars;
+        self.ret_ty = saved_ret;
+        self.instance_depth -= 1;
+        self.current_span = saved_span;
+        self.comptime_env = saved_env;
+    }
+
+    /// Check a generic function nothing calls, which has no widths of its own. Some widths may
+    /// not work, like `tbl` at anything but 16 lanes, and that's fine: a call at such a width
+    /// is checked when it appears. So the body is only wrong if it fails at every width tried.
+    fn check_uncalled_generic(&mut self, def: &ast::FnDef) {
+        let mut best: Option<(HashMap<String, u64>, Vec<TypeError>)> = None;
+        for env in widths_to_try(def, &self.module_env) {
+            let Err(errors) = self.try_instance(def, &env) else { return };
+            if best.as_ref().is_none_or(|(_, fewest)| errors.len() < fewest.len()) {
+                best = Some((env, errors));
+            }
+        }
+        let Some((env, errors)) = best else { return };
+        let mut bindings: Vec<String> =
+            def.comptime_params.iter().map(|c| format!("{}={}", c.name, env[&c.name])).collect();
+        bindings.sort();
+        let context = format!("in generic '{}', which fails at every width tried (this is {})", def.name, bindings.join(", "));
+        for mut error in errors {
+            error.message = format!("{}: {}", context, error.message);
+            self.errors.push(error);
+        }
+    }
+
+    /// The errors from checking one instance, leaving the checker as it was. A width can also
+    /// make compiling the body panic, such as `N - 16` underflowing, which counts as an error.
+    fn try_instance(&mut self, def: &ast::FnDef, env: &HashMap<String, u64>) -> Result<(), Vec<TypeError>> {
+        let saved_instances = self.checked_instances.clone();
+        let saved_vars = self.vars.clone();
+        let saved_ret = self.ret_ty.clone();
+        let saved_depth = self.instance_depth;
+        let saved_span = self.current_span;
+        let saved_env = self.comptime_env.clone();
+        let earlier_errors = std::mem::take(&mut self.errors);
+
+        TRYING_WIDTHS.with(|flag| flag.set(true));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.check_instance(def, env)));
+        TRYING_WIDTHS.with(|flag| flag.set(false));
+
+        let mut errors = std::mem::replace(&mut self.errors, earlier_errors);
+        if let Err(payload) = outcome {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "compiling this function failed".to_string());
+            errors.push(TypeError { message, span: saved_span });
+        }
+        self.checked_instances = saved_instances;
+        self.vars = saved_vars;
+        self.ret_ty = saved_ret;
+        self.instance_depth = saved_depth;
+        self.current_span = saved_span;
+        self.comptime_env = saved_env;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
@@ -2051,6 +2161,17 @@ pub fn typecheck_for(
             }
             if !checker.generics.contains_key(&f.name) {
                 checker.check_fn(f);
+            }
+        }
+    }
+
+    // Calls have checked every generic that has one. The rest would otherwise go unchecked.
+    let called: Vec<String> = checker.checked_instances.iter().cloned().collect();
+    for item in items {
+        if let ast::Item::Fn(f) = item {
+            let prefix = format!("{}[", f.name);
+            if checker.generics.contains_key(&f.name) && !called.iter().any(|key| key.starts_with(&prefix)) {
+                checker.check_uncalled_generic(f);
             }
         }
     }

@@ -144,6 +144,8 @@ pub enum Item {
     Struct(StructDef),
     Fn(FnDef),
     Const(ConstDef),
+    /// `comptime fn`: runs while parsing, to build tables. Gone before type checking.
+    ComptimeFn(FnDef),
 }
 
 /// A read-only table in static storage: `const NAME = [u8: 1, 2, 3]`.
@@ -153,6 +155,23 @@ pub struct ConstDef {
     pub name: String,
     pub elem_type: String,
     pub values: Vec<i64>,
+    /// Lanes that `T[i]` reads: 16 for `[u8[16]: ...]`, otherwise 1.
+    pub row: u64,
+    /// How to fill `values`, for a table computed at compile time.
+    pub comprehension: Option<Box<Comprehension>>,
+}
+
+/// `[u8: f(i) for i in 0..256]`, or `[u8[16]: row(i) for i in 0..256 fill 255]` where `row`
+/// produces each row with `emit`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comprehension {
+    pub elem_type: String,
+    pub row: Option<u64>,
+    pub fill: Option<i64>,
+    pub value: Expr,
+    pub var: String,
+    pub start: Expr,
+    pub end: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +204,9 @@ pub struct FnDef {
     pub params: Vec<Param>,
     pub ret_ty: Option<Type>,
     pub body: Vec<Stmt>,
+    /// For a function with a range stream, whose escapes are lowered only once the stream
+    /// is expanded: the struct it returns, if it returns one.
+    pub ret_struct: Option<StructDef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +287,9 @@ pub enum StmtKind {
         body: Vec<Stmt>,
         carry_updates: Vec<(String, Expr)>,
     },
+    /// `stream chunk: u8[N] over p[a..b] tail ... { ... }`. Expanded into plain `while`
+    /// and `if` by `streams.rs`, once the register width and `N` are known.
+    RangeStream(Box<RangeStream>),
     If {
         cond: Expr,
         then_body: Vec<Stmt>,
@@ -274,6 +299,37 @@ pub enum StmtKind {
         cond: Expr,
         body: Vec<Stmt>,
     },
+}
+
+/// What a range stream does with input that doesn't fill a chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Tail {
+    /// The last chunk ends at the range's end and may re-read bytes. Shorter input runs on
+    /// narrower chunks. Needs `until`, and rules out carries since bytes can be seen twice.
+    Overlap,
+    /// The last chunk is partial, with `chunk_len` valid lanes.
+    Masked,
+    /// Stop before a partial chunk. `chunk_offset` says where.
+    Leave,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeStream {
+    pub chunk_name: String,
+    pub chunk_ty: Type,
+    pub buffer: String,
+    pub start: Expr,
+    pub end: Expr,
+    pub tail: Tail,
+    /// A side-effect-free per-lane test. The body only runs on chunks where no lane is true.
+    pub until: Option<Expr>,
+    pub carry: Vec<CarryDef>,
+    pub body: Vec<Stmt>,
+    pub carry_updates: Vec<(String, Expr)>,
+    /// Runs when the stream stops early, with everything from `chunk_offset` unhandled.
+    pub stopped: Option<Vec<Stmt>>,
+    /// Filled in with the target's register width before expansion.
+    pub register_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,6 +368,19 @@ pub enum Expr {
     VecLit {
         elem_type: String,
         values: Vec<i64>,
+    },
+    /// [type: f(i) for i in a..b]. Becomes a `VecLit` before type checking.
+    VecComp(Box<Comprehension>),
+    /// `T[i]`, one element of a const table or slice. Becomes a load before type checking.
+    Index {
+        name: String,
+        index: Box<Expr>,
+    },
+    /// `s[a..b]`, part of a slice. Lowered before type checking.
+    SubSlice {
+        name: String,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
     },
 
     BinOp {
@@ -579,10 +648,10 @@ pub fn sides_that_continue(cond: &Expr, then_body: &[Stmt], else_body: &[Stmt]) 
 /// Names the language defines. Functions can't reuse them.
 pub const BUILTINS: &[&str] = &[
     "any", "any_in_first", "bit_shl", "bit_shr", "bswap", "clear_lowest_bit", "clmul", "compress",
-    "compressstore", "concat", "ctz", "extract", "fold_min", "from_bitmask", "gather", "iota",
+    "compressstore", "concat", "ctz", "emit", "extract", "fold_min", "from_bitmask", "gather", "iota",
     "lane_shl", "lane_shr", "likely", "load", "load_at", "loadu", "mask8", "max", "min",
     "nibblemask", "popcount", "ptr_add", "ptr_addr", "scan_dfa", "shuffle", "split_hi", "split_lo",
-    "sqrt", "store", "store_at", "tbl", "to_bitmask", "to_i16", "to_i32", "to_i64", "to_i8",
+    "set_bits", "sqrt", "store", "store_at", "tbl", "to_bitmask", "to_i16", "to_i32", "to_i64", "to_i8",
     "to_u16", "to_u32", "to_u64", "to_u8", "unlikely", "xor",
 ];
 

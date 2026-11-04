@@ -4,11 +4,13 @@ use crate::lexer::{Lexer, Spanned, Token};
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Numbers the variables a `for` introduces.
+    next_hidden_name: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, next_hidden_name: 0 }
     }
 
     // --- Helpers ---
@@ -76,6 +78,10 @@ impl Parser {
                 Token::Struct => items.push(Item::Struct(self.parse_struct_def())),
                 Token::Fn => items.push(Item::Fn(self.parse_fn_def())),
                 Token::Const => items.push(Item::Const(self.parse_const_def())),
+                Token::Comptime => {
+                    self.pos += 1;
+                    items.push(Item::ComptimeFn(self.parse_fn_def()));
+                }
                 Token::NoInline | Token::Private | Token::Extern => {
                     let (mut noinline, mut private, mut extern_c) = (false, false, false);
                     loop {
@@ -106,8 +112,17 @@ impl Parser {
         self.expect(&Token::Const);
         let name = self.expect_ident();
         self.expect(&Token::Eq);
-        match self.parse_vec_lit() {
-            Expr::VecLit { elem_type, values } => ConstDef { name, elem_type, values },
+        let (literal, row) = self.parse_vec_lit_or_rows();
+        let row = row.unwrap_or(1);
+        match literal {
+            Expr::VecLit { elem_type, values } => ConstDef { name, elem_type, values, row, comprehension: None },
+            Expr::VecComp(comprehension) => ConstDef {
+                name,
+                elem_type: comprehension.elem_type.clone(),
+                values: Vec::new(),
+                row,
+                comprehension: Some(comprehension),
+            },
             other => panic!("const '{}' must be a vector literal, got {:?}", name, other),
         }
     }
@@ -193,7 +208,7 @@ impl Parser {
         self.expect(&Token::LBrace);
         let mut body = Vec::new();
         while *self.peek() != Token::RBrace {
-            body.push(self.parse_stmt());
+            self.parse_stmt_into(&mut body);
         }
         self.expect(&Token::RBrace);
 
@@ -206,6 +221,7 @@ impl Parser {
             params,
             ret_ty,
             body,
+            ret_struct: None,
         }
     }
 
@@ -216,6 +232,9 @@ impl Parser {
             let w = self.parse_width();
             self.expect(&Token::RBracket);
             Some(w)
+        } else if matches!(name.as_str(), "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "bool") {
+            // A plain `i64` is a scalar, the same as `i64[1]`.
+            Some(Width::Fixed(1))
         } else {
             None
         };
@@ -296,8 +315,154 @@ impl Parser {
 
     // --- Statements ---
 
+    /// Parse a statement into `out`. Only `for` needs more than one: it lowers to the
+    /// statements you'd write by hand, so it costs nothing.
+    fn parse_stmt_into(&mut self, out: &mut Vec<Stmt>) {
+        let is_for = matches!(self.peek(), Token::Ident(name) if name == "for")
+            && matches!(self.peek_at(1), Token::Ident(_))
+            && matches!(self.peek_at(2), Token::Ident(name) if name == "in");
+        if is_for {
+            self.parse_for(out);
+        } else {
+            out.push(self.parse_stmt());
+        }
+    }
+
+    /// `for i in a..b step k { ... }`, which leaves `i` at the first value that's out of
+    /// range. `b` and `k` are evaluated once.
+    fn parse_for(&mut self, out: &mut Vec<Stmt>) {
+        let span = self.current_span();
+        self.pos += 1;
+        let var = self.expect_ident();
+        self.pos += 1; // in
+        if matches!(self.peek(), Token::Ident(name) if name == "set_bits") && *self.peek_at(1) == Token::LParen {
+            self.parse_for_set_bits(var, span, out);
+            return;
+        }
+        let start = self.parse_expr();
+        self.expect(&Token::Dot);
+        self.expect(&Token::Dot);
+        let end = self.parse_expr();
+        let step = if matches!(self.peek(), Token::Ident(name) if name == "step") {
+            self.pos += 1;
+            let step = self.parse_expr();
+            if matches!(step.const_value(), Some(ConstValue::Int(n)) if n <= 0) {
+                panic!("at {}: a `for` step must be positive", span);
+            }
+            step
+        } else {
+            Expr::IntLit(1)
+        };
+        self.expect(&Token::LBrace);
+        let mut body = Vec::new();
+        while *self.peek() != Token::RBrace {
+            self.parse_stmt_into(&mut body);
+        }
+        self.expect(&Token::RBrace);
+
+        let scalar = || Type { name: "i64".to_string(), width: Some(Width::Fixed(1)) };
+        let assign = |name: &str, ty: Option<Type>, value: Expr| Stmt {
+            kind: StmtKind::Assign { target: AssignTarget::Ident(name.to_string()), ty, value },
+            span,
+        };
+        self.next_hidden_name += 1;
+        let end_name = format!("__for_end_{}", self.next_hidden_name);
+        let step_name = format!("__for_step_{}", self.next_hidden_name);
+        out.push(assign(&var, Some(scalar()), start));
+        out.push(assign(&end_name, Some(scalar()), end));
+        out.push(assign(&step_name, Some(scalar()), step));
+
+        let mut assigned = Vec::new();
+        crate::desugar::collect_assigned(&body, &mut assigned);
+        if assigned.contains(&var) {
+            panic!("at {}: the `for` variable '{}' can't be assigned in its body", span, var);
+        }
+        body.push(assign(
+            &var,
+            None,
+            Expr::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident(var.clone())),
+                rhs: Box::new(Expr::Ident(step_name)),
+            },
+        ));
+        let cond = Expr::BinOp {
+            op: BinOp::Lt,
+            lhs: Box::new(Expr::Ident(var)),
+            rhs: Box::new(Expr::Ident(end_name)),
+        };
+        out.push(Stmt { kind: StmtKind::While { cond, body }, span });
+    }
+
+    /// `for i in set_bits(x) { ... }`: `i` is the position of each 1 bit in `x`, lowest first.
+    fn parse_for_set_bits(&mut self, var: String, span: Span, out: &mut Vec<Stmt>) {
+        self.pos += 2; // set_bits (
+        let bits = self.parse_expr();
+        self.expect(&Token::RParen);
+        self.expect(&Token::LBrace);
+        let mut body = Vec::new();
+        while *self.peek() != Token::RBrace {
+            self.parse_stmt_into(&mut body);
+        }
+        self.expect(&Token::RBrace);
+
+        let mut assigned = Vec::new();
+        crate::desugar::collect_assigned(&body, &mut assigned);
+        if assigned.contains(&var) {
+            panic!("at {}: the `for` variable '{}' can't be assigned in its body", span, var);
+        }
+        self.next_hidden_name += 1;
+        let hidden = format!("__for_bits_{}", self.next_hidden_name);
+        let assign = |name: &str, value: Expr| Stmt {
+            kind: StmtKind::Assign { target: AssignTarget::Ident(name.to_string()), ty: None, value },
+            span,
+        };
+        let call = |name: &str, arg: Expr| Expr::Call {
+            func: Box::new(Expr::Ident(name.to_string())),
+            args: vec![CallArg { name: None, value: arg }],
+        };
+        let position = call("to_i64", call("ctz", Expr::Ident(hidden.clone())));
+        let mut lowered = vec![assign(&var, position)];
+        lowered.extend(body);
+        lowered.push(assign(&hidden, call("clear_lowest_bit", Expr::Ident(hidden.clone()))));
+        out.push(assign(&hidden, bits));
+        let cond = Expr::BinOp {
+            op: BinOp::NotEq,
+            lhs: Box::new(Expr::Ident(hidden)),
+            rhs: Box::new(Expr::IntLit(0)),
+        };
+        out.push(Stmt { kind: StmtKind::While { cond, body: lowered }, span });
+    }
+
     fn parse_stmt(&mut self) -> Stmt {
         let span = self.current_span();
+
+        // x += e, and the same for - * & | ^ << >>
+        if let Token::Ident(name) = self.peek().clone() {
+            let op = match self.peek_at(1) {
+                Token::Plus => Some(BinOp::Add),
+                Token::Minus => Some(BinOp::Sub),
+                Token::Star => Some(BinOp::Mul),
+                Token::Amp => Some(BinOp::And),
+                Token::Pipe => Some(BinOp::Or),
+                Token::Caret => Some(BinOp::Xor),
+                Token::LtLt => Some(BinOp::BitShl),
+                Token::GtGt => Some(BinOp::BitShr),
+                _ => None,
+            };
+            if let (Some(op), Token::Eq) = (op, self.peek_at(2)) {
+                self.pos += 3;
+                let value = Expr::BinOp {
+                    op,
+                    lhs: Box::new(Expr::Ident(name.clone())),
+                    rhs: Box::new(self.parse_expr()),
+                };
+                return Stmt {
+                    kind: StmtKind::Assign { target: AssignTarget::Ident(name), ty: None, value },
+                    span,
+                };
+            }
+        }
 
         if *self.peek() == Token::Return {
             self.pos += 1;
@@ -437,6 +602,8 @@ impl Parser {
         let chunk_ty = self.parse_type();
         self.expect(&Token::Over);
         let buffer = self.expect_ident();
+        let tail_follows = matches!(self.peek(), Token::Ident(name) if name == "tail");
+        let range = (*self.peek() == Token::LBracket || tail_follows).then(|| self.parse_stream_range(&buffer));
 
         // Parse carry state: carry (name: type = init, ...)
         let mut carry = Vec::new();
@@ -481,10 +648,44 @@ impl Parser {
                 if !carry_updates.is_empty() {
                     panic!("at {}: carry updates must come last in a stream body", self.current_span());
                 }
-                body.push(self.parse_stmt());
+                self.parse_stmt_into(&mut body);
             }
         }
         self.expect(&Token::RBrace);
+
+        if let Some((start, end, tail, until)) = range {
+            // `stopped` isn't reserved: it's only special right after a stream's body.
+            let stopped = if matches!(self.peek(), Token::Ident(name) if name == "stopped")
+                && *self.peek_at(1) == Token::LBrace
+            {
+                self.pos += 2;
+                let mut stmts = Vec::new();
+                while *self.peek() != Token::RBrace {
+                    self.parse_stmt_into(&mut stmts);
+                }
+                self.expect(&Token::RBrace);
+                Some(stmts)
+            } else {
+                None
+            };
+            return Stmt {
+                kind: StmtKind::RangeStream(Box::new(RangeStream {
+                    chunk_name,
+                    chunk_ty,
+                    buffer,
+                    start,
+                    end,
+                    tail,
+                    until,
+                    carry,
+                    body,
+                    carry_updates,
+                    stopped,
+                    register_bytes: None,
+                })),
+                span,
+            };
+        }
 
         Stmt {
             kind: StmtKind::Stream {
@@ -499,6 +700,40 @@ impl Parser {
         }
     }
 
+    /// Parse: [start..end] tail overlap until test(chunk). `tail` and `until` aren't
+    /// reserved, so they still work as variable names.
+    fn parse_stream_range(&mut self, buffer: &str) -> (Expr, Expr, Tail, Option<Expr>) {
+        // Leaving out the range, or its end, means up to a slice's length.
+        let whole = Expr::Field { base: Box::new(Expr::Ident(buffer.to_string())), field: "len".to_string() };
+        let (start, end) = if *self.peek() == Token::LBracket {
+            self.pos += 1;
+            let start = if *self.peek() == Token::Dot { Expr::IntLit(0) } else { self.parse_expr() };
+            self.expect(&Token::Dot);
+            self.expect(&Token::Dot);
+            let end = if *self.peek() == Token::RBracket { whole } else { self.parse_expr() };
+            self.expect(&Token::RBracket);
+            (start, end)
+        } else {
+            (Expr::IntLit(0), whole)
+        };
+        if !matches!(self.peek(), Token::Ident(name) if name == "tail") {
+            panic!("at {}: a stream over a range needs a tail: overlap, masked or leave", self.current_span());
+        }
+        self.pos += 1;
+        let span = self.current_span();
+        let tail = match self.expect_ident().as_str() {
+            "overlap" => Tail::Overlap,
+            "masked" => Tail::Masked,
+            "leave" => Tail::Leave,
+            other => panic!("at {}: unknown tail '{}': use overlap, masked or leave", span, other),
+        };
+        let until = matches!(self.peek(), Token::Ident(name) if name == "until").then(|| {
+            self.pos += 1;
+            self.parse_expr()
+        });
+        (start, end, tail, until)
+    }
+
     /// Parse: if cond { ... } else { ... }
     fn parse_if(&mut self, span: Span) -> Stmt {
         self.expect(&Token::If);
@@ -506,7 +741,7 @@ impl Parser {
         self.expect(&Token::LBrace);
         let mut then_body = Vec::new();
         while *self.peek() != Token::RBrace {
-            then_body.push(self.parse_stmt());
+            self.parse_stmt_into(&mut then_body);
         }
         self.expect(&Token::RBrace);
 
@@ -519,7 +754,7 @@ impl Parser {
             } else {
                 self.expect(&Token::LBrace);
                 while *self.peek() != Token::RBrace {
-                    else_body.push(self.parse_stmt());
+                    self.parse_stmt_into(&mut else_body);
                 }
                 self.expect(&Token::RBrace);
             }
@@ -542,7 +777,7 @@ impl Parser {
         self.expect(&Token::LBrace);
         let mut body = Vec::new();
         while *self.peek() != Token::RBrace {
-            body.push(self.parse_stmt());
+            self.parse_stmt_into(&mut body);
         }
         self.expect(&Token::RBrace);
 
@@ -590,9 +825,77 @@ impl Parser {
 
     /// Parse [type: val, val, ...] or [type: val; count] — constant vector literal
     fn parse_vec_lit(&mut self) -> Expr {
+        self.parse_vec_lit_or_rows().0
+    }
+
+    /// `[u8[16]: ...]` gives a table rows; `[u8: ...]` is a plain vector or table.
+    fn parse_vec_lit_or_rows(&mut self) -> (Expr, Option<u64>) {
         self.expect(&Token::LBracket);
         let elem_type = self.expect_ident();
+        let row = (*self.peek() == Token::LBracket).then(|| {
+            self.pos += 1;
+            let Token::IntLit(row) = self.peek().clone() else {
+                panic!("at {}: a table's row width must be a number", self.current_span());
+            };
+            self.pos += 1;
+            self.expect(&Token::RBracket);
+            row as u64
+        });
         self.expect(&Token::Colon);
+        if let Some(comprehension) = self.try_parse_comprehension(&elem_type, row) {
+            return (comprehension, row);
+        }
+        (self.parse_vec_lit_values(elem_type), row)
+    }
+
+    /// `f(i) for i in 0..256 fill 255`. `for`, `in` and `fill` aren't reserved.
+    fn try_parse_comprehension(&mut self, elem_type: &str, row: Option<u64>) -> Option<Expr> {
+        let saved = self.pos;
+        // A literal list starts with a number and a separator, so it's never a comprehension.
+        let starts_with_number = matches!(self.peek(), Token::IntLit(_) | Token::Minus)
+            && matches!(self.peek_at(1), Token::Comma | Token::Semicolon | Token::RBracket | Token::IntLit(_));
+        if starts_with_number {
+            return None;
+        }
+        let value = self.parse_expr();
+        if !matches!(self.peek(), Token::Ident(name) if name == "for") {
+            self.pos = saved;
+            return None;
+        }
+        self.pos += 1;
+        let var = self.expect_ident();
+        if !matches!(self.peek(), Token::Ident(name) if name == "in") {
+            panic!("at {}: expected `in` in a comprehension", self.current_span());
+        }
+        self.pos += 1;
+        let start = self.parse_expr();
+        self.expect(&Token::Dot);
+        self.expect(&Token::Dot);
+        let end = self.parse_expr();
+        let fill = matches!(self.peek(), Token::Ident(name) if name == "fill").then(|| {
+            self.pos += 1;
+            let span = self.current_span();
+            match self.parse_expr().const_value() {
+                Some(ConstValue::Int(n)) => n,
+                _ => panic!("at {}: `fill` must be a number", span),
+            }
+        });
+        if fill.is_some() && row.is_none() {
+            panic!("at {}: `fill` only applies to a table with rows", self.current_span());
+        }
+        self.expect(&Token::RBracket);
+        Some(Expr::VecComp(Box::new(Comprehension {
+            elem_type: elem_type.to_string(),
+            row,
+            fill,
+            value,
+            var,
+            start,
+            end,
+        })))
+    }
+
+    fn parse_vec_lit_values(&mut self, elem_type: String) -> Expr {
 
         // Parse first value
         let neg = if *self.peek() == Token::Minus {
@@ -857,6 +1160,8 @@ impl Parser {
         let mut expr = self.parse_primary();
         loop {
             match self.peek() {
+                // `a..b` is a range, not a field access.
+                Token::Dot if *self.peek_at(1) == Token::Dot => break,
                 Token::Dot => {
                     self.pos += 1;
                     let field = self.expect_ident();
@@ -975,6 +1280,23 @@ impl Parser {
                     if let Some(callee) = self.try_parse_instantiation() {
                         return callee;
                     }
+                    // A `[` starting the next line is a new statement, not an index.
+                    self.pos += 1;
+                    if !self.at_line_start() {
+                        self.pos += 1;
+                        let start = (*self.peek() != Token::Dot).then(|| Box::new(self.parse_expr()));
+                        if *self.peek() == Token::Dot {
+                            self.pos += 1;
+                            self.expect(&Token::Dot);
+                            let end = (*self.peek() != Token::RBracket).then(|| Box::new(self.parse_expr()));
+                            self.expect(&Token::RBracket);
+                            return Expr::SubSlice { name, start, end };
+                        }
+                        self.expect(&Token::RBracket);
+                        let index = start.expect("a bracket starting with `..` is a range");
+                        return Expr::Index { name, index };
+                    }
+                    return Expr::Ident(name);
                 }
 
                 self.pos += 1;
@@ -1998,6 +2320,7 @@ mod tests {
                 params: vec![],
                 ret_ty: None,
                 body: vec![],
+                ret_struct: None,
             })]
         );
     }
@@ -2019,6 +2342,7 @@ mod tests {
                 ],
                 ret_ty: Some(ty("f32", Some(Width::Fixed(8)))),
                 body: vec![Stmt { kind: StmtKind::Return(binop(BinOp::Add, ident("a"), ident("b"))), span: Span::dummy() }],
+                ret_struct: None,
             })]
         );
     }
@@ -2055,6 +2379,7 @@ mod tests {
                     op: ReductionOp::Add,
                     operand: Box::new(binop(BinOp::Mul, ident("a"), ident("b"))),
                 }), span: Span::dummy() }],
+                ret_struct: None,
             })]
         );
     }

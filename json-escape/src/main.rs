@@ -28,7 +28,7 @@ fn race(mut a: impl FnMut(), mut b: impl FnMut(), budget_ms: f64, rounds: usize)
     let iters = ((budget_ms / once.max(1e-6)) as usize).clamp(1, 2_000_000);
 
     let (mut xs, mut ys) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
-    let mut timed = |f: &mut dyn FnMut() -> ()| {
+    let timed = |f: &mut dyn FnMut() -> ()| {
         let t = Instant::now();
         for _ in 0..iters {
             f();

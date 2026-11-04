@@ -37,8 +37,12 @@ cargo run --release -- compile examples/json_stage1.simd --target x86_64-unknown
 |---|---|---|
 | `aarch64-*` | NEON | 16 bytes |
 | `x86_64-*` | AVX2 and PCLMUL (`-march=x86-64-v3 -mpclmul`) | 32 bytes |
+| `x86_64-*` with `--isa sse4.2` | SSE4.2 and PCLMUL (`x86-64-v2`) | 16 bytes |
+| `x86_64-*` with `--isa avx512` | AVX-512 and PCLMUL (`x86-64-v4`) | 64 bytes |
 
 A program means the same thing on both, and the test suite passes on both. `--cpu` overrides the CPU that code is generated for, such as `--cpu znver5`. That can use newer instructions, but the language still treats a register as the size in the table.
+
+`--dispatch sse4.2,avx2` builds one library holding each listed level. The first call checks the CPU and the OS, and later calls jump straight to the best level, so a binary runs on any x86-64 CPU that has one of them. It's opt-in because the indirect jump isn't free, and it only handles `extern fn`s taking scalars and pointers. The library also gets `<name>_isa()`, which says which level this CPU got. A CPU with none of the listed levels traps on the first call.
 
 ## The language
 
@@ -50,6 +54,7 @@ u8[64]       -- 64 bytes
 i32[4]       -- 4 ints
 bool[64]     -- 64 booleans
 u64[1]       -- "scalar" u64
+u64          -- the same, for short
 ptr[u8]      -- pointer to a buffer
 ```
 
@@ -117,6 +122,8 @@ prefix_xor = scan.xor(bits, seed) -- inclusive prefix XOR with carry
 
 Reductions: `+/` `*/` `|/` `&/` `max/` `min/`. They follow the lane type's signedness.
 
+`any` of `x <= K` and `x == K` compares on `u8` lanes takes the lane-wise minimum first, so `any(is_escape(a) | is_escape(b))` needs one compare of each kind however wide `a` and `b` are. This sees through `private` functions that are a single `return`.
+
 Scans: `scan.add` `scan.xor` `scan.max` `scan.preceding_any`. `scan.preceding_any` shifts by one lane, so each lane holds the previous lane's value.
 
 #### `scan_dfa` — prefix scan over a finite automaton
@@ -172,6 +179,27 @@ return count
 
 `carry` updates come last in the body and apply together, using the values from before any of them. A carry with no update keeps its value. Assigning to an outer variable in the body is an error, because only carries leave a stream. A chunk's lane type must be the buffer's element type. The buffer's size must be a whole number of chunks, since a final partial chunk is read past the end of the buffer.
 
+To process part of a buffer whose length is only known at runtime, give a range and say what happens to the input that doesn't fill a chunk:
+
+```
+stream chunk: u8[4 * REGISTER_BYTES] over src[0..n] tail overlap until is_escape(chunk) {
+    store_at(dst, chunk_offset + 1, chunk)
+} stopped {
+    return slow_path(src, chunk_offset, n, dst)
+}
+return n
+```
+
+| Tail | What happens to the end of the input |
+|---|---|
+| `tail overlap` | The last chunk ends exactly at the end, and may re-read bytes. Input shorter than a chunk runs on narrower ones, down to one register, then one register testing only the lanes in range. |
+| `tail masked` | The last chunk is partial, with `chunk_len` valid lanes. It never reads past the page holding the last byte. |
+| `tail leave` | Stops before a partial chunk, so another stream can continue from `chunk_offset`. |
+
+`until` is a per-lane test that can't write memory, and the body only runs on chunks where no lane is true. That lets the compiler test two chunks with one branch before running either chunk's body. `stopped` runs when the stream stops early, with everything from `chunk_offset` on still to be handled. That isn't always because a lane matched: the shortest input also goes there if a read would cross a page, so `stopped` has to cope with clean input. Without a `stopped` that returns, the code after the stream runs, and `chunk_offset` says where it stopped.
+
+A range stream expands to the `while` and `if` you'd write by hand, so it costs nothing. `chunk_offset` here is an `i64[1]`, and stays set after the stream. The body can `return`, and carries work as above except with `tail overlap`, which sees some bytes twice and so rejects them.
+
 ### If/else
 
 ```
@@ -184,9 +212,32 @@ if cond {
 
 `else if` chains work too. Only the taken branch runs, so stores inside it are conditional. Afterwards a variable holds its new value if either branch reassigned it; a name first defined inside the `if` is visible afterwards only if both branches define it.
 
+`for i in a..b { ... }` counts up, and `for i in a..b step k` takes a positive step. It lowers to a `while`, so it costs the same. `a` and `b` are `i64`, `b` and `k` are evaluated once, and afterwards `i` holds the first value out of range.
+
+`for lane in set_bits(bits)` visits the position of each 1 bit in a 64-bit integer, lowest first, as an `i64`. It lowers to the `ctz` and `clear_lowest_bit` loop, and `bits` itself isn't changed.
+
+`x += e` works for `+ - * & | ^ << >>`, and means `x = x + e`, so `d += a - b` groups differently from `d = d + a - b`.
+
 `while cond { ... }` is a real loop, `break` leaves the innermost one, and `return` works anywhere except inside a `stream`. `a && b` and `a || b` work on scalar bools and only evaluate `b` if needed; `&` and `|` work lane-wise and always evaluate both. `likely(cond)` and `unlikely(cond)` say which way a condition usually goes, so the other path is laid out away from the hot path.
 
 Escapes compile to flags, which LLVM's jump threading removes: `json_escape`'s hot path has no flag checks left. A function returning a pointer can only `return` as its last statement.
+
+### Slices
+
+```
+extern fn count(s: slice[u8]) -> i64 {
+    stream c: u8[16] over s tail masked carry (seen: i64 = 0) {
+        carry seen = seen + chunk_len
+    }
+    return seen
+}
+```
+
+`slice[T]` is a pointer and a length. It has `s.len` and `s.ptr`, `s[i]` reads one element, and `s[a..b]`, `s[a..]` and `s[..b]` make a smaller slice, to assign to a name or pass to a slice parameter. Anywhere a pointer is expected, a slice works as its pointer. `over s` and `over s[a..]` run up to the slice's length.
+
+A slice costs nothing itself, because it lowers to two plain values. An `extern fn` taking a slice has the C signature `(T *s, int64_t s_len)`, and a generated Rust binding takes it as one `&mut [T]`.
+
+There are no bounds checks: `s[i]` and `s[a..b]` trust their indices. A stream over a slice stays in range by construction, apart from the deliberate reads past the end within a page described above. A slice can't be returned or be a struct field yet.
 
 ### Const tables
 
@@ -194,7 +245,31 @@ Escapes compile to flags, which LLVM's jump threading removes: `json_escape`'s h
 const TABLE = [u8: 10, 20, 30, 40]
 ```
 
-Read-only static data. Inside functions `TABLE` is a pointer.
+Read-only static data. Inside functions `TABLE` is a pointer, and `TABLE[i]` reads one element. Indexing isn't bounds-checked.
+
+A table can be computed at compile time, by a `comptime fn` that runs on integers while the program is parsed:
+
+```
+comptime fn count_bits(x: i64) -> i64 {
+    if x == 0 { return 0 }
+    return (x & 1) + count_bits(x >> 1)
+}
+const POPCOUNT8 = [u8: count_bits(x) for x in 0..256]
+```
+
+For a table of rows, give the row width and have the function `emit` each row. `TABLE[i]` then reads a whole row, as a `u8[16]` here. `fill` says what goes in the lanes a row doesn't emit, and without it a short row is an error:
+
+```
+comptime fn expansion(mask: i64) {
+    for lane in 0..8 {
+        if ((mask >> lane) & 1) == 1 { emit(8) }
+        emit(lane)
+    }
+}
+const EXPAND = [u8[16]: expansion(mask) for mask in 0..256 fill 255]
+```
+
+A `comptime fn` can use scalars, `if`, `for`, `while`, `break`, `return` and calls to other `comptime fn`s. Arithmetic that overflows, a loop that doesn't finish, and a value that doesn't fit the table are all compile errors. Comprehensions also work for local vectors, like `lanes = [u8: i for i in 0..16]`. Their range must be literal numbers, so it can't depend on `REGISTER_BYTES` or `N` yet.
 
 ### Width generics
 
@@ -401,17 +476,20 @@ where ours is ASCII-focused.
 
 - **Variable lane shifts.** `lane_shr` and `lane_shl` take literal amounts.
 - **Seeded `scan.max`.** Only `scan.add` and `scan.xor` take a seed.
-- **Escaping a `stream`.** `return` and `break` can't leave one.
+- **Leaving a buffer `stream`.** `return` and `break` can't leave one. A range stream can `return`, but not `break`.
+- **Other range stream shapes.** Chunks must be `u8`. `until` only works with `tail overlap`, whose chunks must be 1, 2, 4... registers. `tail masked` only takes 16-lane chunks. Streams can't nest.
 - **Early return of a pointer.** A function returning a `ptr` can only `return` as its last statement.
 
 All of these are compile errors, not wrong results.
 
-Two things aren't checked. Function bodies are checked once per set of widths they're called with, so a generic function nothing calls isn't checked at all. `any_in_first(mask, n)` needs `n` from 1 to the lane count, which is checked only when `n` is a literal.
+`any_in_first(mask, n)` needs `n` from 1 to the lane count, which is checked only when `n` is a literal.
+
+A generic function is checked once per set of widths it's called with. One that nothing calls is tried at widths 1, 2, 4 ... 64, and is an error only if it fails at all of them. So a mistake that doesn't depend on the width is always caught, and one that only shows up at certain widths waits until a call uses them. A generic that only works at some other width, such as `u8[N + 1]` passed to `tbl`, is rejected until something calls it.
 
 ## How it works
 
 ```
-.simd source → lexer → parser → desugar → type checker → MLIR codegen → mlir-translate → clang -O3 → .a + .rs
+.simd source → lexer → parser → stream expansion → desugar → type checker → MLIR codegen → mlir-translate → clang -O3 → .a + .rs
 ```
 
 Errors include source locations (`error at 3:5: undefined variable: foo`). The type checker catches width mismatches, bad builtin args, etc. before codegen.

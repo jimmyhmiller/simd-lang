@@ -22,6 +22,8 @@ libc = "0.2"
 [features]
 # Race against the crate's optional AVX-512 kernels instead of its default AVX2 ones.
 crate-avx512 = ["json-escape-simd/avx512"]
+# The library was built with --dispatch, so `isa()` exists. See build-kernel.sh.
+dispatch = []
 
 [dev-dependencies]
 serde_json = "1"

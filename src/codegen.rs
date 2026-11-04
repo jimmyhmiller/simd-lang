@@ -221,20 +221,49 @@ enum Binding<'c, 'a> {
 pub enum Arch {
     /// NEON, 16-byte registers.
     Aarch64,
-    /// AVX2 and PCLMUL (x86-64-v3 plus PCLMUL), 32-byte registers.
-    X86_64,
+    X86_64(X86Isa),
+}
+
+/// Which x86 instructions a build may use. Each includes PCLMUL.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum X86Isa {
+    /// x86-64-v2, 16-byte registers.
+    Sse42,
+    /// x86-64-v3, 32-byte registers. The default.
+    Avx2,
+    /// x86-64-v4, 64-byte registers.
+    Avx512,
+}
+
+impl X86Isa {
+    pub fn from_name(name: &str) -> Option<X86Isa> {
+        match name {
+            "sse4.2" => Some(X86Isa::Sse42),
+            "avx2" => Some(X86Isa::Avx2),
+            "avx512" => Some(X86Isa::Avx512),
+            _ => None,
+        }
+    }
+
+    pub fn march(self) -> &'static str {
+        match self {
+            X86Isa::Sse42 => "x86-64-v2",
+            X86Isa::Avx2 => "x86-64-v3",
+            X86Isa::Avx512 => "x86-64-v4",
+        }
+    }
 }
 
 impl Arch {
     pub fn host() -> Arch {
-        if cfg!(target_arch = "x86_64") { Arch::X86_64 } else { Arch::Aarch64 }
+        if cfg!(target_arch = "x86_64") { Arch::X86_64(X86Isa::Avx2) } else { Arch::Aarch64 }
     }
 
     /// The architecture of an LLVM target triple.
     pub fn of_triple(triple: &str) -> Option<Arch> {
         match triple.split('-').next()? {
             "aarch64" | "arm64" => Some(Arch::Aarch64),
-            "x86_64" => Some(Arch::X86_64),
+            "x86_64" => Some(Arch::X86_64(X86Isa::Avx2)),
             _ => None,
         }
     }
@@ -244,16 +273,17 @@ impl Arch {
         match (Arch::host(), cfg!(target_os = "macos")) {
             (Arch::Aarch64, true) => "aarch64-apple-darwin",
             (Arch::Aarch64, false) => "aarch64-unknown-linux-gnu",
-            (Arch::X86_64, true) => "x86_64-apple-darwin",
-            (Arch::X86_64, false) => "x86_64-unknown-linux-gnu",
+            (Arch::X86_64(_), true) => "x86_64-apple-darwin",
+            (Arch::X86_64(_), false) => "x86_64-unknown-linux-gnu",
         }
     }
 
     /// The width of one vector register.
     pub fn register_bytes(self) -> u64 {
         match self {
-            Arch::Aarch64 => 16,
-            Arch::X86_64 => 32,
+            Arch::Aarch64 | Arch::X86_64(X86Isa::Sse42) => 16,
+            Arch::X86_64(X86Isa::Avx2) => 32,
+            Arch::X86_64(X86Isa::Avx512) => 64,
         }
     }
 }
@@ -390,6 +420,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
             ast::Expr::Load { aligned, ty, ptr, offset } => self.emit_load(*aligned, ty, ptr, offset.as_deref()),
 
+            ast::Expr::VecComp(_) | ast::Expr::Index { .. } | ast::Expr::SubSlice { .. } => {
+                unreachable!("comprehensions and indexing are resolved after parsing")
+            }
             ast::Expr::VecLit { elem_type, values } => {
                 let scalar = ScalarType::from_name(elem_type);
                 let width = values.len() as u64;
@@ -1308,7 +1341,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
         let vec16 = Type::vector(&[16], IntegerType::new(self.ctx, 8).into());
         match self.arch() {
             Arch::Aarch64 => self.emit_intrinsic("llvm.aarch64.neon.tbl1", &[table16, idx16], vec16),
-            Arch::X86_64 => {
+            Arch::X86_64(_) => {
                 // pshufb only zeroes a lane whose index has its high bit set, and otherwise
                 // uses the low 4 bits. Adding 0x70 with saturation sets the high bit exactly
                 // for indices of 16 or more, and leaves the low 4 bits of the rest alone.
@@ -2731,7 +2764,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
 
                 let pmull: Value = match self.arch() {
                     Arch::Aarch64 => self.emit_intrinsic("llvm.aarch64.neon.pmull64", &[a_scalar, b_scalar], vec16xi8),
-                    Arch::X86_64 => {
+                    Arch::X86_64(_) => {
                         let wrap = |this: &mut Self, value: Value<'c, 'a>| -> Value<'c, 'a> {
                             this.block
                                 .append_operation(
@@ -3156,27 +3189,26 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                         register
                     ));
                 }
-                let result_ty = VecType { scalar: ScalarType::U8, width: register };
-                let result_mlir = result_ty.to_mlir_type(self.ctx);
-                let mut folded = self.emit_extract_lanes(val, 0, register);
-                let mut offset = register;
-                while offset < ty.width {
-                    let slice = self.emit_extract_lanes(val, offset as usize, register);
-                    folded = self
-                        .block
-                        .append_operation(
-                            OperationBuilder::new("arith.minui", self.loc)
-                                .add_operands(&[folded, slice])
-                                .add_results(&[result_mlir])
-                                .build()
-                                .expect("failed to build arith.minui"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    offset += register;
+                // Halve while the width allows it, for a tree instead of a longer chain.
+                let (mut folded, mut width) = (val, ty.width);
+                while width > register && width % (2 * register) == 0 {
+                    let half = width / 2;
+                    let lo = self.emit_extract_lanes(folded, 0, half);
+                    let hi = self.emit_extract_lanes(folded, half as usize, half);
+                    folded = self.emit_minui(lo, hi, half);
+                    width = half;
                 }
-                (folded, result_ty)
+                if width > register {
+                    let mut rest = self.emit_extract_lanes(folded, 0, register);
+                    let mut offset = register;
+                    while offset < width {
+                        let slice = self.emit_extract_lanes(folded, offset as usize, register);
+                        rest = self.emit_minui(rest, slice, register);
+                        offset += register;
+                    }
+                    folded = rest;
+                }
+                (folded, VecType { scalar: ScalarType::U8, width: register })
             }
             ast::Expr::Ident(name) if name == "any_in_first" => {
                 // any_in_first(bool[N], n) → whether any of the first n lanes is true, for
@@ -3185,7 +3217,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 let (mask, mask_ty) = self.emit_expr(&args[0].value);
                 let supported = match self.arch() {
                     Arch::Aarch64 => mask_ty.width == 16,
-                    Arch::X86_64 => matches!(mask_ty.width, 16 | 32 | 64),
+                    Arch::X86_64(_) => matches!(mask_ty.width, 16 | 32 | 64),
                 };
                 if mask_ty.scalar != ScalarType::Bool || !supported {
                     self.error(&format!(
@@ -3232,7 +3264,7 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                             .into();
                         (self.emit_nibblemask16(bytes), 4)
                     }
-                    Arch::X86_64 => {
+                    Arch::X86_64(_) => {
                         let packed: Value = self
                             .block
                             .append_operation(
@@ -3419,7 +3451,11 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
             ast::Expr::Ident(name) if name == "any" => {
                 // any(bool[N]) → bool[1], true if any lane is true
                 assert_eq!(args.len(), 1, "any takes exactly 1 argument");
-                let (val, ty) = self.emit_expr(&args[0].value);
+                let folded = self.any_as_fold_min(&args[0].value);
+                let (val, ty) = match &folded {
+                    Some(groups) => self.emit_folded_compares(groups),
+                    None => self.emit_expr(&args[0].value),
+                };
                 assert_eq!(ty.scalar, ScalarType::Bool, "any requires bool vector");
                 if ty.width == 1 {
                     return (val, ty);
@@ -3940,6 +3976,9 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 // Handled by the caller (emit_fn); desugaring leaves these last in a function
             }
             ast::StmtKind::Break => self.error("break outside of a loop"),
+            ast::StmtKind::RangeStream(_) => {
+                self.error("internal error: a range stream reached codegen unexpanded");
+            }
             ast::StmtKind::Stream {
                 chunk_name,
                 chunk_ty,
@@ -3982,6 +4021,180 @@ impl<'c, 'a> FnCodegen<'c, 'a> {
                 self.emit_while(cond, body);
             }
         }
+    }
+
+    /// `any` of `x <= K` and `x == K` on u8 lanes, across several registers, written so one
+    /// compare of each kind is enough: `x <= K` anywhere iff the lane-wise minimum of the
+    /// `x`s is, and `x == K` anywhere iff the minimum of the `x ^ K`s is zero. Sees through
+    /// private functions that are a single `return`, so a classifier is only written once.
+    /// `None` if the expression has another shape, or if this wouldn't save anything.
+    fn any_as_fold_min(&self, arg: &ast::Expr) -> Option<Vec<(ast::Expr, ast::BinOp, i64)>> {
+        let mut leaves = Vec::new();
+        self.collect_compare_leaves(arg, &mut leaves)?;
+        let mut width = None;
+        let mut at_most: Vec<(i64, Vec<ast::Expr>)> = Vec::new();
+        let mut is_zero: Vec<ast::Expr> = Vec::new();
+        let mut order: Vec<Option<i64>> = Vec::new();
+        for (op, x, k) in leaves {
+            let ty = self.simple_lane_type(&x)?;
+            if ty.scalar != ScalarType::U8 || *width.get_or_insert(ty.width) != ty.width || !(0..=255).contains(&k) {
+                return None;
+            }
+            match op {
+                ast::BinOp::LtEq => {
+                    if !at_most.iter().any(|(bound, _)| *bound == k) {
+                        at_most.push((k, Vec::new()));
+                        order.push(Some(k));
+                    }
+                    at_most.iter_mut().find(|(bound, _)| *bound == k)?.1.push(x);
+                }
+                _ => {
+                    if is_zero.is_empty() {
+                        order.push(None);
+                    }
+                    let lane = ast::Expr::BinOp {
+                        op: ast::BinOp::Xor,
+                        lhs: Box::new(x),
+                        rhs: Box::new(ast::Expr::IntLit(k)),
+                    };
+                    is_zero.push(if k == 0 { Self::strip_xor_zero(lane) } else { lane });
+                }
+            }
+        }
+        let several = at_most.iter().any(|(_, xs)| xs.len() > 1) || is_zero.len() > 1;
+        if !several && width? <= self.arch().register_bytes() {
+            return None;
+        }
+        let call = |name: &str, args: Vec<ast::Expr>| ast::Expr::Call {
+            func: Box::new(ast::Expr::Ident(name.to_string())),
+            args: args.into_iter().map(|value| ast::CallArg { name: None, value }).collect(),
+        };
+        let fold = |xs: Vec<ast::Expr>| {
+            let min = xs
+                .into_iter()
+                .reduce(|a, b| call("min", vec![a, b]))
+                .expect("a compare group has at least one member");
+            call("fold_min", vec![min])
+        };
+        let mut groups = at_most.into_iter().collect::<HashMap<_, _>>();
+        let mut zero = Some(is_zero);
+        Some(
+            order
+                .into_iter()
+                .map(|group| match group {
+                    Some(k) => (fold(groups.remove(&k).expect("each bound appears once")), ast::BinOp::LtEq, k),
+                    None => (fold(zero.take().expect("zero appears once")), ast::BinOp::EqEq, 0),
+                })
+                .collect(),
+        )
+    }
+
+    /// Every lane-wise minimum, and only then the compares, OR'd together.
+    fn emit_folded_compares(&mut self, groups: &[(ast::Expr, ast::BinOp, i64)]) -> (Value<'c, 'a>, VecType) {
+        let names: Vec<String> = (0..groups.len()).map(|i| format!("__fold_{}", i)).collect();
+        for ((folded, _, _), name) in groups.iter().zip(&names) {
+            let (value, ty) = self.emit_expr(folded);
+            self.vars.insert(name.clone(), Binding::Vec(value, ty));
+        }
+        let compared = groups
+            .iter()
+            .zip(&names)
+            .map(|((_, op, k), name)| ast::Expr::BinOp {
+                op: *op,
+                lhs: Box::new(ast::Expr::Ident(name.clone())),
+                rhs: Box::new(ast::Expr::IntLit(*k)),
+            })
+            .reduce(|a, b| ast::Expr::BinOp { op: ast::BinOp::Or, lhs: Box::new(a), rhs: Box::new(b) })
+            .expect("there is at least one compare group");
+        let result = self.emit_expr(&compared);
+        for name in &names {
+            self.vars.remove(name);
+        }
+        result
+    }
+
+    fn strip_xor_zero(lane: ast::Expr) -> ast::Expr {
+        match lane {
+            ast::Expr::BinOp { lhs, .. } => *lhs,
+            other => other,
+        }
+    }
+
+    /// The `x <= K` and `x == K` compares joined by `|` in `expr`, or `None` if it has anything else.
+    fn collect_compare_leaves(&self, expr: &ast::Expr, out: &mut Vec<(ast::BinOp, ast::Expr, i64)>) -> Option<()> {
+        match expr {
+            ast::Expr::BinOp { op: ast::BinOp::Or, lhs, rhs } => {
+                self.collect_compare_leaves(lhs, out)?;
+                self.collect_compare_leaves(rhs, out)
+            }
+            ast::Expr::BinOp { op: op @ (ast::BinOp::LtEq | ast::BinOp::EqEq), lhs, rhs } => {
+                let Some(ast::ConstValue::Int(k)) = rhs.const_value() else { return None };
+                out.push((*op, (**lhs).clone(), k));
+                Some(())
+            }
+            ast::Expr::Call { func, args } => {
+                let name = match func.as_ref() {
+                    ast::Expr::Ident(name) | ast::Expr::Instantiate { name, .. } => name,
+                    _ => return None,
+                };
+                let def = self.fn_defs.get(name)?;
+                let [ast::Stmt { kind: ast::StmtKind::Return(value), .. }] = def.body.as_slice() else { return None };
+                if def.noinline || !def.private || def.params.len() != args.len() {
+                    return None;
+                }
+                // Arguments that are plain names can be repeated without repeating any work.
+                let mut replacements = HashMap::new();
+                for (param, arg) in def.params.iter().zip(args) {
+                    if arg.name.is_some() || !matches!(arg.value, ast::Expr::Ident(_)) {
+                        return None;
+                    }
+                    replacements.insert(param.name.clone(), arg.value.clone());
+                }
+                let mut inlined = value.clone();
+                crate::comptime::walk_expr(&mut inlined, &mut |e| {
+                    if let ast::Expr::Ident(name) = e {
+                        if let Some(replacement) = replacements.get(name) {
+                            *e = replacement.clone();
+                        }
+                    }
+                });
+                self.collect_compare_leaves(&inlined, out)
+            }
+            _ => None,
+        }
+    }
+
+    /// The type of a variable, possibly combined with literals. Nothing is emitted.
+    fn simple_lane_type(&self, expr: &ast::Expr) -> Option<VecType> {
+        match expr {
+            ast::Expr::Ident(name) => match self.vars.get(name)? {
+                Binding::Vec(_, ty) => Some(*ty),
+                _ => None,
+            },
+            ast::Expr::BinOp { op: ast::BinOp::Xor | ast::BinOp::And | ast::BinOp::Or, lhs, rhs } => {
+                match (lhs.const_value(), rhs.const_value()) {
+                    (None, Some(_)) => self.simple_lane_type(lhs),
+                    (Some(_), None) => self.simple_lane_type(rhs),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_minui(&mut self, a: Value<'c, 'a>, b: Value<'c, 'a>, width: u64) -> Value<'c, 'a> {
+        let ty = VecType { scalar: ScalarType::U8, width }.to_mlir_type(self.ctx);
+        self.block
+            .append_operation(
+                OperationBuilder::new("arith.minui", self.loc)
+                    .add_operands(&[a, b])
+                    .add_results(&[ty])
+                    .build()
+                    .expect("failed to build arith.minui"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
     }
 
     /// A value of the same type as `binding`, for a path that never reads it.
@@ -4603,12 +4816,6 @@ fn emit_const_global<'c>(ctx: &'c Context, def: &ast::ConstDef) -> Operation<'c>
     let elem = scalar.to_mlir_type(ctx);
     let len = def.values.len() as i64;
     let memref_ty = MemRefType::new(elem, &[len], None, None);
-    if scalar.is_int() {
-        let bits = scalar.bit_width();
-        if let Some(bad) = def.values.iter().find(|&&v| bits < 64 && (v < -(1i64 << (bits - 1)) || v >= (1i64 << bits))) {
-            panic!("const '{}': literal {} doesn't fit in {:?}", def.name, bad, scalar);
-        }
-    }
     let elem_name = format!("i{}", scalar.bit_width());
     let numbers: Vec<String> = def.values.iter().map(|v| v.to_string()).collect();
     let dense = melior::ir::attribute::Attribute::parse(
@@ -5023,6 +5230,7 @@ pub fn compile_module_for<'c>(
                     module.body().append_operation(entry);
                 }
             }
+            ast::Item::ComptimeFn(_) => unreachable!("comptime fns are gone after parsing"),
             ast::Item::Struct(_) | ast::Item::Const(_) => {
                 // Structs are erased; consts were emitted above
             }
@@ -12057,6 +12265,1019 @@ mod scalar_and_branch_tests {
                 x = x + 1
             }
         }", &[0, 9]), [4, 9]);
+    }
+
+    /// The message a program is rejected with, whether by parsing or by the type checker.
+    fn rejection(source: &str) -> String {
+        let source = source.to_string();
+        let result = std::panic::catch_unwind(move || {
+            let items = parser::parse(&source);
+            match typecheck::typecheck(&items, &HashMap::new()) {
+                Ok(()) => "accepted".to_string(),
+                Err(errors) => errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+            }
+        });
+        match result {
+            Ok(message) => message,
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        }
+    }
+
+    fn overlap_program(width: &str) -> String {
+        format!(
+            r#"
+            private fn is_stop[N](v: u8[N]) -> bool[N] {{
+                return (v == 200) | (v <= 3)
+            }}
+            extern fn f(src: ptr[u8], start: i64[1], n: i64[1], dst: ptr[u8]) -> i64[1] {{
+                stream chunk: u8[{width}] over src[start..n] tail overlap until is_stop(chunk) {{
+                    store_at(dst, chunk_offset, chunk)
+                }} stopped {{
+                    return chunk_offset
+                }}
+                return n
+            }}
+        "#
+        )
+    }
+
+    type OverlapFn = extern "C" fn(*const u8, i64, i64, *mut u8) -> i64;
+
+    /// `f` returns where it stopped. Everything before that must be copied, it can't pass
+    /// the first stop byte in range, and bytes outside the range must not matter.
+    fn check_overlap(f: OverlapFn, src: &[u8], start: usize, n: usize, may_stop_early: bool, what: &str) {
+        let register = Arch::host().register_bytes() as usize;
+        let mut dst = vec![9u8; n + 16 * register + 16];
+        let stopped_at = f(src.as_ptr(), start as i64, n as i64, dst.as_mut_ptr()) as usize;
+        let first_stop = src[start..n]
+            .iter()
+            .position(|&b| b == 200 || b <= 3)
+            .map_or(n, |p| start + p);
+        assert!(stopped_at >= start && stopped_at <= first_stop, "{what}: stopped at {stopped_at}, first stop {first_stop}");
+        assert_eq!(&dst[start..stopped_at], &src[start..stopped_at], "{what}: wrong copy");
+        if first_stop == n && !may_stop_early {
+            assert_eq!(stopped_at, n, "{what}: stopped with nothing to stop for");
+        }
+    }
+
+    #[test]
+    fn overlap_streams_copy_up_to_the_first_stop_at_every_width_and_length() {
+        for width in ["REGISTER_BYTES", "2 * REGISTER_BYTES", "4 * REGISTER_BYTES", "8 * REGISTER_BYTES"] {
+            with_fn(&overlap_program(width), "f", |p| unsafe {
+                let f: OverlapFn = std::mem::transmute(p);
+                let register = Arch::host().register_bytes() as usize;
+                let padding = 16 * register;
+                for start in [0usize, 1, 7] {
+                    for len in 0..(10 * register) {
+                        let n = start + len;
+                        // Stop bytes around the range, which must not count. An 8192-byte
+                        // alignment keeps these reads clear of a page boundary.
+                        let mut backing = vec![200u8; 3 * 8192 + n + padding];
+                        let base = backing.as_ptr() as usize;
+                        let aligned = (8192 - base % 8192) % 8192 + 512;
+                        let src = &mut backing[aligned..];
+                        for (i, byte) in src[start..n].iter_mut().enumerate() {
+                            *byte = 60 + (i % 100) as u8;
+                        }
+                        check_overlap(f, src, start, n, false, &format!("{width}, start {start}, clean {len}"));
+                        for stop in 0..len {
+                            for byte in [200u8, 0, 3] {
+                                let saved = src[start + stop];
+                                src[start + stop] = byte;
+                                check_overlap(f, src, start, n, false, &format!("{width}, start {start}, len {len}, stop {stop}"));
+                                src[start + stop] = saved;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn overlap_streams_handle_reads_that_would_cross_a_page() {
+        with_fn(&overlap_program("4 * REGISTER_BYTES"), "f", |p| unsafe {
+            let f: OverlapFn = std::mem::transmute(p);
+            let register = Arch::host().register_bytes() as usize;
+            let mut backing = vec![65u8; 3 * 8192];
+            let base = backing.as_ptr() as usize;
+            let page_end = (8192 - base % 8192) % 8192 + 4096;
+            for len in 0..register {
+                for back in 1..=register {
+                    let src = &backing[page_end - back..];
+                    if len <= back {
+                        check_overlap(f, src, 0, len, true, &format!("len {len}, {back} bytes from the end"));
+                    }
+                }
+            }
+            backing[page_end - 1] = 0;
+            check_overlap(f, &backing[page_end - 3..], 0, 3, true, "a stop byte at the page end");
+        });
+    }
+
+    #[test]
+    fn a_stopped_block_that_falls_through_skips_the_rest_of_the_stream() {
+        let source = r#"
+            private fn is_stop[N](v: u8[N]) -> bool[N] { return v == 200 }
+            extern fn f(src: ptr[u8], n: i64[1], dst: ptr[u8], where_it_stopped: ptr[i64]) -> i64[1] {
+                flag: i64[1] = 0
+                stream chunk: u8[2 * REGISTER_BYTES] over src[0..n] tail overlap until is_stop(chunk) {
+                    store_at(dst, chunk_offset, chunk)
+                } stopped {
+                    flag = 1
+                }
+                store(where_it_stopped, chunk_offset)
+                return flag
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, *mut u8, *mut i64) -> i64 = std::mem::transmute(p);
+            let register = Arch::host().register_bytes() as usize;
+            let mut backing = vec![65u8; 8192 * 3];
+            let base = backing.as_ptr() as usize;
+            let aligned = (8192 - base % 8192) % 8192 + 512;
+            let src = &mut backing[aligned..];
+            for n in [register, 2 * register, 5 * register, 9 * register + 3] {
+                let mut dst = vec![0u8; n + 16 * register];
+                let mut stopped_at = -1i64;
+                assert_eq!(f(src.as_ptr(), n as i64, dst.as_mut_ptr(), &mut stopped_at), 0, "clean {n}");
+                assert_eq!(stopped_at, n as i64);
+                src[n - 1] = 200;
+                let mut stopped_at = -1i64;
+                assert_eq!(f(src.as_ptr(), n as i64, dst.as_mut_ptr(), &mut stopped_at), 1, "dirty {n}");
+                assert!(stopped_at < n as i64);
+                src[n - 1] = 65;
+            }
+        });
+    }
+
+    #[test]
+    fn until_without_stopped_falls_out_of_the_stream() {
+        let source = r#"
+            extern fn f(src: ptr[u8], n: i64[1], dst: ptr[u8]) -> i64[1] {
+                stream chunk: u8[REGISTER_BYTES] over src[0..n] tail overlap until chunk == 200 {
+                    store_at(dst, chunk_offset, chunk)
+                }
+                return chunk_offset
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, *mut u8) -> i64 = std::mem::transmute(p);
+            let register = Arch::host().register_bytes() as usize;
+            let mut backing = vec![65u8; 8192 * 3];
+            let base = backing.as_ptr() as usize;
+            let aligned = (8192 - base % 8192) % 8192 + 512;
+            let src = &mut backing[aligned..];
+            let mut dst = vec![0u8; 16 * register];
+            let n = 4 * register + 5;
+            assert_eq!(f(src.as_ptr(), n as i64, dst.as_mut_ptr()), n as i64);
+            src[2 * register + 1] = 200;
+            assert_eq!(f(src.as_ptr(), n as i64, dst.as_mut_ptr()), 2 * register as i64);
+        });
+    }
+
+    #[test]
+    fn masked_streams_see_every_byte_once_and_slide_past_a_page_end() {
+        let source = r#"
+            extern fn f(src: ptr[u8], start: i64[1], n: i64[1], dst: ptr[u8]) -> i64[1] {
+                stream chunk: u8[16] over src[start..n] tail masked carry (out: i64[1] = 0, seen: i64[1] = 0) {
+                    store_at(dst, out, chunk)
+                    carry out = out + chunk_len
+                    carry seen = seen + 1
+                }
+                return out * 1000 + seen
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64, *mut u8) -> i64 = std::mem::transmute(p);
+            let mut backing: Vec<u8> = (0..8192 * 3).map(|i| (i % 251) as u8).collect();
+            let base = backing.as_mut_ptr() as usize;
+            let page_end = (8192 - base % 8192) % 8192 + 4096;
+            for from_end in [100usize, 64, 33, 17, 16, 15, 8, 1] {
+                for len in 0..=from_end {
+                    for start in [0usize, 3] {
+                        if start > len {
+                            continue;
+                        }
+                        let src = &backing[page_end - from_end..];
+                        let mut dst = vec![0u8; len + 64];
+                        let got = f(src.as_ptr(), start as i64, len as i64, dst.as_mut_ptr());
+                        let count = len - start;
+                        assert_eq!(got, count as i64 * 1000 + count.div_ceil(16) as i64, "{from_end}, {start}..{len}");
+                        assert_eq!(&dst[..count], &src[start..len], "{from_end}, {start}..{len}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn carries_in_a_range_stream_update_together() {
+        let source = r#"
+            extern fn f(src: ptr[u8], n: i64[1]) -> i64[1] {
+                stream chunk: u8[16] over src[0..n] tail leave carry (a: i64[1] = 1, b: i64[1] = 2) {
+                    carry a = b
+                    carry b = a
+                }
+                return a * 10 + b
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            let buf = [0u8; 64];
+            assert_eq!(f(buf.as_ptr(), 0), 12);
+            assert_eq!(f(buf.as_ptr(), 16), 21);
+            assert_eq!(f(buf.as_ptr(), 40), 12);
+        });
+    }
+
+    #[test]
+    fn leave_stops_at_the_last_whole_chunk_for_the_next_stream() {
+        let source = r#"
+            extern fn f(src: ptr[u8], n: i64[1], dst: ptr[u8]) -> i64[1] {
+                stream chunk: u8[64] over src[0..n] tail leave carry (out: i64[1] = 0) {
+                    store_at(dst, out, chunk)
+                    carry out = out + 64
+                }
+                big = chunk_offset
+                stream block: u8[16] over src[big..n] tail masked carry (out: i64[1] = out) {
+                    store_at(dst, out, block)
+                    carry out = out + chunk_len
+                }
+                return big * 10000 + out
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, *mut u8) -> i64 = std::mem::transmute(p);
+            let mut backing: Vec<u8> = (0..8192 * 3).map(|i| (i % 251) as u8).collect();
+            let base = backing.as_mut_ptr() as usize;
+            let aligned = (8192 - base % 8192) % 8192 + 512;
+            let src = &backing[aligned..];
+            for n in 0..300usize {
+                let mut dst = vec![0u8; n + 128];
+                let got = f(src.as_ptr(), n as i64, dst.as_mut_ptr());
+                assert_eq!(got, (n / 64 * 64) as i64 * 10000 + n as i64, "{n}");
+                assert_eq!(&dst[..n], &src[..n], "{n}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_range_stream_can_return_from_its_body() {
+        let source = r#"
+            struct Found[N] { at: i64[N], seen: i64[N] }
+            extern fn first(src: ptr[u8], n: i64[1]) -> i64[1] {
+                stream chunk: u8[16] over src[0..n] tail leave {
+                    if any(chunk == 7) {
+                        return chunk_offset
+                    }
+                }
+                return 0 - 1
+            }
+            private fn found(src: ptr[u8], n: i64[1]) -> Found[1] {
+                stream chunk: u8[16] over src[0..n] tail leave carry (seen: i64[1] = 0) {
+                    if any(chunk == 7) {
+                        return Found[1] { at: chunk_offset, seen: seen }
+                    }
+                    carry seen = seen + 1
+                }
+                return Found[1] { at: 0 - 1, seen: seen }
+            }
+            extern fn g(src: ptr[u8], n: i64[1]) -> i64[1] {
+                r = found(src, n)
+                return r.at * 100 + r.seen
+            }
+        "#;
+        with_fn(source, "first", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            let mut buf = [0u8; 64];
+            assert_eq!(f(buf.as_ptr(), 64), -1);
+            buf[35] = 7;
+            assert_eq!(f(buf.as_ptr(), 64), 32);
+            assert_eq!(f(buf.as_ptr(), 32), -1);
+        });
+        with_fn(source, "g", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            let mut buf = [0u8; 64];
+            assert_eq!(f(buf.as_ptr(), 64), -100 + 4);
+            buf[35] = 7;
+            assert_eq!(f(buf.as_ptr(), 64), 3200 + 2);
+        });
+    }
+
+    #[test]
+    fn a_range_stream_works_in_a_generic_function_and_at_native_width() {
+        let source = r#"
+            private fn count[N](src: ptr[u8], n: i64[1]) -> i64[1] {
+                stream chunk: u8[N] over src[0..n] tail leave carry (seen: i64[1] = 0) {
+                    carry seen = seen + 1
+                }
+                return seen
+            }
+            private fn count_native(src: ptr[u8], n: i64[1]) -> i64[1] {
+                stream chunk: u8[_] over src[0..n] tail leave carry (seen: i64[1] = 0) {
+                    carry seen = seen + 1
+                }
+                return seen
+            }
+            extern fn f(src: ptr[u8], n: i64[1]) -> i64[1] {
+                return count[16](src, n) * 10000 + count[32](src, n) * 100 + count_native(src, n)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            let buf = [0u8; 200];
+            let native = Arch::host().register_bytes() as i64;
+            assert_eq!(f(buf.as_ptr(), 100), 6 * 10000 + 3 * 100 + 100 / native);
+        });
+    }
+
+    #[test]
+    fn tail_until_and_stopped_still_work_as_names() {
+        let source = r#"
+            extern fn f(tail: i64[1], until: i64[1]) -> i64[1] {
+                stopped = tail + until
+                return stopped
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(3, 4), 7);
+        });
+    }
+
+    #[test]
+    fn range_streams_reject_what_they_cant_do() {
+        let wrap = |body: &str| format!("extern fn f(src: ptr[u8], n: i64[1], dst: ptr[u8]) -> i64[1] {{\n{body}\nreturn 0 }}");
+        for (body, expected) in [
+            ("stream c: u8[16] over src[0..n] { }", "needs a tail"),
+            ("stream c: u8[16] over src[0..n] tail nonsense { }", "unknown tail"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap { }", "needs `until`"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until c == 1 carry (x: i64[1] = 0) { }", "can't have carries"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until c == 1 { if n == 0 { break } }", "can't `break`"),
+            ("stream c: u8[3 * REGISTER_BYTES] over src[0..n] tail overlap until c == 1 { }", "1, 2, 4"),
+            ("stream c: u8[1] over src[0..n] tail overlap until c == 1 { }", "1, 2, 4"),
+            ("stream c: u8[16] over src[0..n] tail leave until c == 1 { }", "only works with `tail overlap`"),
+            ("stream c: u8[16] over src[0..n] tail masked until c == 1 { }", "only works with `tail overlap`"),
+            ("stream c: u8[16] over src[0..n] tail leave { } stopped { }", "needs an `until`"),
+            ("stream c: u8[32] over src[0..n] tail masked { }", "16-lane"),
+            ("stream c: u8[16] over src[0..n] tail leave { if n == 0 { break } }", "isn't supported yet"),
+            ("stream c: u8[16] over src[0..n] tail leave { stream d: u8[16] over src[0..n] tail leave { } }", "another stream"),
+            ("stream c: u8[16] over src carry (x: i64[1] = 0) { stream d: u8[16] over src[0..n] tail leave { } }", "can't contain"),
+            ("stream c: u32[4] over src[0..n] tail leave { }", "only supports u8"),
+            ("k: i64[1] = 0\nstream c: u8[16] over src[0..n] tail leave { k = 1 }", "make it a carry"),
+            ("stream c: u8[16] over src[0..n] tail leave { chunk_offset = 1 }", "set by the stream"),
+            ("stream c: u8[16] over src[0..n] tail leave carry (x: i64[1] = 0) { carry y = 1 }", "isn't one of"),
+            ("stream c: u8[16] over src[0..n] tail leave carry (x: i64[1] = 0) { carry x = 1\n carry x = 2 }", "updated twice"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until c == chunk_offset { }", "`until` can't use"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until store_at(dst, 0, c) { }", "can't write memory"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until c { }", "bool"),
+            ("stream c: u8[REGISTER_BYTES] over src[0..n] tail overlap until c == 1 { } stopped { store_at(dst, 0, c) }", "c"),
+            ("x: u8[1] = 0\nstream c: u8[16] over src[x..n] tail leave { }", "expected I64"),
+        ] {
+            let message = rejection(&wrap(body));
+            assert_ne!(message, "accepted", "{body} should be rejected");
+            assert!(message.contains(expected), "{body}: expected '{expected}', got: {message}");
+        }
+        let writes_through_a_call = r#"
+            private fn sneaky[N](p: ptr[u8], v: u8[N]) -> bool[N] {
+                store_at(p, 0, v)
+                return v == 1
+            }
+            extern fn f(src: ptr[u8], n: i64[1]) -> i64[1] {
+                stream c: u8[16] over src[0..n] tail overlap until sneaky(src, c) { }
+                return 0
+            }
+        "#;
+        assert!(rejection(writes_through_a_call).contains("can't write memory"));
+    }
+
+    /// `any` of u8 compares, with one lane changed at a time, against the same compare in Rust.
+    fn check_any_of_compares(source: &str, lanes: usize, value: u8, expected: impl Fn(u8) -> bool) {
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            let mut buf = vec![value; 2 * lanes];
+            let base_result = f(buf.as_ptr(), 0) != 0;
+            assert_eq!(base_result, expected(value), "{source} with every lane {value}");
+            for lane in 0..2 * lanes {
+                for byte in 0..=255u8 {
+                    buf[lane] = byte;
+                    let want = expected(byte) || expected(value);
+                    assert_eq!(f(buf.as_ptr(), 0) != 0, want, "{source}: lane {lane} = {byte}");
+                }
+                buf[lane] = value;
+            }
+        });
+    }
+
+    #[test]
+    fn any_of_compares_folded_to_minimums_gives_the_same_answers() {
+        let register = Arch::host().register_bytes() as usize;
+        let program = |compare: &str| {
+            format!(
+                r#"
+                private fn is_it[N](v: u8[N]) -> bool[N] {{ return {compare} }}
+                extern fn f(p: ptr[u8], unused: i64[1]) -> i64[1] {{
+                    a = load_at[u8[2 * REGISTER_BYTES]](p, 0)
+                    b = load_at[u8[2 * REGISTER_BYTES]](p, 2 * REGISTER_BYTES)
+                    if any(is_it(a) | is_it(b)) {{ return 1 }}
+                    return 0
+                }}
+            "#
+            )
+        };
+        let lanes = 2 * register;
+        check_any_of_compares(&program("((v ^ 2) <= 32) | (v == '\\\\')"), lanes, 65, |b| (b ^ 2) <= 32 || b == b'\\');
+        check_any_of_compares(&program("v <= 3"), lanes, 65, |b| b <= 3);
+        check_any_of_compares(&program("(v <= 3) | (v <= 9)"), lanes, 65, |b| b <= 9);
+        check_any_of_compares(&program("v == 0"), lanes, 65, |b| b == 0);
+        check_any_of_compares(&program("(v == 0) | (v == 255) | (v == 7)"), lanes, 65, |b| b == 0 || b == 255 || b == 7);
+        check_any_of_compares(&program("((v ^ 255) <= 0) | (v <= 1)"), lanes, 65, |b| b == 255 || b <= 1);
+        check_any_of_compares(&program("(v & 15) == 3"), lanes, 64, |b| b & 15 == 3);
+    }
+
+    #[test]
+    fn any_of_signed_compares_is_left_alone() {
+        let source = r#"
+            extern fn f(p: ptr[i8], unused: i64[1]) -> i64[1] {
+                a = load_at[i8[32]](p, 0)
+                b = load_at[i8[32]](p, 32)
+                if any((a <= 3) | (b <= 3)) { return 1 }
+                return 0
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const i8, i64) -> i64 = std::mem::transmute(p);
+            let mut buf = vec![65i8; 64];
+            assert_eq!(f(buf.as_ptr(), 0), 0);
+            buf[40] = -5;
+            assert_eq!(f(buf.as_ptr(), 0), 1, "-5 <= 3 as a signed lane");
+        });
+    }
+
+    #[test]
+    fn fold_min_works_across_three_registers() {
+        let source = r#"
+            extern fn f(p: ptr[u8], out: ptr[u8]) {
+                store_at(out, 0, fold_min(load_at[u8[3 * REGISTER_BYTES]](p, 0)))
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(*const u8, *mut u8) = std::mem::transmute(p);
+            let register = Arch::host().register_bytes() as usize;
+            for lane in 0..3 * register {
+                let mut buf = vec![200u8; 3 * register];
+                buf[lane] = 5;
+                let mut out = vec![0u8; register];
+                f(buf.as_ptr(), out.as_mut_ptr());
+                assert_eq!(out[lane % register], 5, "lane {lane}");
+                assert_eq!(out.iter().filter(|&&b| b == 5).count(), 1, "lane {lane}");
+            }
+        });
+    }
+
+    #[test]
+    fn comptime_fns_fill_tables_and_indexing_reads_them() {
+        let source = r#"
+            comptime fn squared(x: i64) -> i64 { return x * x }
+            comptime fn triangle(n: i64) -> i64 {
+                total: i64 = 0
+                for i in 0..n + 1 {
+                    if i == 200 { break }
+                    total += i
+                }
+                return total
+            }
+            comptime fn row(i: i64) {
+                for lane in 0..i {
+                    emit(lane + 10)
+                }
+            }
+            const SQUARES = [u8: squared(i) for i in 0..16]
+            const TRIANGLES = [u32: triangle(i) for i in 0..300]
+            const WIDE = [u64: 1 << i for i in 0..63]
+            const ROWS = [u8[4]: row(i) for i in 0..5 fill 99]
+            extern fn a(i: i64) -> i64 { return to_i64(SQUARES[i]) }
+            extern fn b(i: i64) -> i64 { return to_i64(TRIANGLES[i]) }
+            extern fn c(i: i64) -> i64 { return to_i64(WIDE[i]) }
+            extern fn d(i: i64, out: ptr[u8]) { store_at(out, 0, ROWS[i]) }
+            extern fn e() -> i64 {
+                v = [u8: i * 2 for i in 0..16]
+                return to_i64(extract(v, 7))
+            }
+        "#;
+        with_fn(source, "a", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            for i in 0..16 {
+                assert_eq!(f(i), i * i);
+            }
+        });
+        with_fn(source, "b", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(4), 10);
+            assert_eq!(f(250), 199 * 200 / 2, "`break` stops the comptime loop");
+        });
+        with_fn(source, "c", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            for i in 0..63 {
+                assert_eq!(f(i), 1i64 << i, "the scale comes from the element size");
+            }
+        });
+        with_fn(source, "d", |p| unsafe {
+            let f: extern "C" fn(i64, *mut u8) = std::mem::transmute(p);
+            let mut out = [0u8; 4];
+            f(0, out.as_mut_ptr());
+            assert_eq!(out, [99, 99, 99, 99]);
+            f(2, out.as_mut_ptr());
+            assert_eq!(out, [10, 11, 99, 99], "rows are 4 lanes apart and filled");
+            f(4, out.as_mut_ptr());
+            assert_eq!(out, [10, 11, 12, 13]);
+        });
+        with_fn(source, "e", |p| unsafe {
+            let f: extern "C" fn() -> i64 = std::mem::transmute(p);
+            assert_eq!(f(), 14);
+        });
+    }
+
+    #[test]
+    fn compile_time_tables_reject_what_they_cant_do() {
+        let func = "\nfn f(x: i64) -> i64 { return x }";
+        for (source, expected) in [
+            ("comptime fn g(x: i64) -> i64 { return 300 }\nconst T = [u8: g(i) for i in 0..4]", "doesn't fit"),
+            ("const T = [u8: i for i in 4..4]", "empty"),
+            ("comptime fn g(x: i64) -> i64 { y = x\n while true { y += 1 }\n return y }\nconst T = [i64: g(i) for i in 0..4]", "overflows|didn't finish"),
+            ("comptime fn g(x: i64) -> i64 { return g(x) }\nconst T = [u8: g(i) for i in 0..4]", "nested"),
+            ("comptime fn g(x: i64) -> i64 { if x == 0 { return 1 } }\nconst T = [u8: g(i) for i in 0..4]", "every path"),
+            ("comptime fn g(x: i64) -> i64 { return x / 0 }\nconst T = [u8: g(i) for i in 0..4]", "overflows"),
+            ("comptime fn g(x: i64) -> i64 { return x << 70 }\nconst T = [u8: g(i) for i in 0..4]", "overflows"),
+            ("comptime fn g(x: i64) -> i64 { return 1 << 63 }\nconst T = [u64: g(i) for i in 0..1]", "overflows"),
+            ("comptime fn g(x: u8[16]) -> i64 { return 0 }", "must be a scalar"),
+            ("comptime fn g(x: i64) -> u8[16] { return 0 }", "must return a scalar"),
+            ("comptime fn g[N](x: i64) -> i64 { return 0 }", "compile-time parameters"),
+            ("comptime fn g(x: i64) -> i64 { return load[u8[16]](x) }\nconst T = [u8: g(i) for i in 0..4]", "only compute with scalars"),
+            ("comptime fn g(x: i64) -> i64 { stream c: u8[16] over x { }\n return 0 }\nconst T = [u8: g(i) for i in 0..4]", "can only use"),
+            ("const T = [u8: h(i) for i in 0..4]", "isn't a comptime fn"),
+            ("const T = [u8: n for i in 0..4]", "undefined variable"),
+            ("const T = [u8: i for i in 0..n]", "known while parsing"),
+            ("comptime fn g(x: i64) { emit(x) }\nconst T = [u8: g(i) for i in 0..4]", "only works in a table with rows"),
+            ("comptime fn g(x: i64) { emit(x)\n emit(x) }\nconst T = [u8[1]: g(i) for i in 0..4]", "more than"),
+            ("comptime fn g(x: i64) { emit(x) }\nconst T = [u8[4]: g(i) for i in 0..4]", "say `fill`"),
+            ("const T = [u8[4]: 1, 2, 3]", "whole rows"),
+            ("const T = [u8: i for i in 0..4 fill 1]", "`fill` only applies"),
+            ("comptime fn g(x: i64) -> i64 { return x }\nfn h() -> i64 { return g(1) }", "comptime fn"),
+            ("fn h(x: i64) -> i64 { return x[1] }", "only const tables"),
+            ("const T = [u8: 1, 2]\nfn h(T: i64) -> i64 { return T[1] }", "only const tables"),
+            ("fn h() -> u8[16] { v = [u8[16]: 1, 2]\n return v }", "expected RBracket"),
+            ("fn emit(x: i64) -> i64 { return x }", "same name as a builtin"),
+            ("fn h(n: i64) -> i64 { for i in 0..n step 0 { }\n return 0 }", "positive"),
+            ("fn h(n: i64) -> i64 { for i in 0..n { i = 1 }\n return 0 }", "can't be assigned"),
+        ] {
+            let message = rejection(&format!("{source}{func}"));
+            assert_ne!(message, "accepted", "should be rejected: {source}");
+            assert!(
+                expected.split('|').any(|e| message.contains(e)),
+                "{source}: expected '{expected}', got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_loops_cover_the_range_and_can_break_and_return() {
+        let source = r#"
+            extern fn sum(n: i64) -> i64 {
+                s: i64 = 0
+                for i in 0..n { s += i }
+                return s
+            }
+            extern fn stepped(n: i64) -> i64 {
+                s: i64 = 0
+                for i in 3..n step 5 { s += i }
+                return s * 1000 + i
+            }
+            extern fn first_multiple(n: i64, of: i64) -> i64 {
+                for i in 1..n {
+                    if i * of > 100 { return i }
+                }
+                return 0 - 1
+            }
+            extern fn stops(n: i64) -> i64 {
+                s: i64 = 0
+                for i in 0..n {
+                    for j in 0..n {
+                        if j == 2 { break }
+                        s += 1
+                    }
+                    if i == 3 { break }
+                }
+                return s
+            }
+            extern fn end_once(n: i64) -> i64 {
+                limit = n
+                count: i64 = 0
+                for i in 0..limit {
+                    limit = 0
+                    count += 1
+                }
+                return count
+            }
+        "#;
+        with_fn(source, "sum", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(0), f(1), f(5), f(-3)), (0, 0, 10, 0));
+        });
+        with_fn(source, "stepped", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(14), (3 + 8 + 13) * 1000 + 18, "and `i` is the first value out of range");
+        });
+        with_fn(source, "first_multiple", |p| unsafe {
+            let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(1000, 7), f(3, 7)), (15, -1));
+        });
+        with_fn(source, "stops", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(10), 8);
+        });
+        with_fn(source, "end_once", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(4), 4, "the end is evaluated once");
+        });
+    }
+
+    #[test]
+    fn compound_assignment_and_plain_scalars() {
+        let source = r#"
+            extern fn f(a: i64, b: u8) -> i64 {
+                x: i64 = a
+                x += 5
+                x -= 1
+                x *= 3
+                x <<= 2
+                x >>= 1
+                x |= 1
+                x &= 255
+                x ^= 2
+                y: u8 = b
+                y >>= 1
+                return x * 1000 + to_i64(y)
+            }
+            extern fn g(a: u32[4]) -> bool {
+                return any(a == 1)
+            }
+        "#;
+        with_fn(source, "f", |p| unsafe {
+            let f: extern "C" fn(i64, u8) -> i64 = std::mem::transmute(p);
+            let mut x = 2i64;
+            x += 5;
+            x -= 1;
+            x *= 3;
+            x <<= 2;
+            x >>= 1;
+            x |= 1;
+            x &= 255;
+            x ^= 2;
+            assert_eq!(f(2, 200), x * 1000 + 100);
+        });
+    }
+
+    #[test]
+    fn a_name_followed_by_a_bracket_on_the_next_line_is_not_an_index() {
+        let source = r#"
+            const T = [u8: 5, 6, 7, 8]
+            fn f(a: f32[4], mask: bool[4], i: i64) -> i64 {
+                x = i
+                [mask] sqrt(a)
+                return x + to_i64(T[i])
+            }
+        "#;
+        // Compiling is the test: read as `x = i[mask]`, this wouldn't.
+        with_fn(source, "f", |_| ());
+    }
+
+    #[test]
+    fn each_x86_level_has_its_own_register_width() {
+        let source = r#"
+            fn f(p: ptr[u8], n: i64) -> i64 {
+                v = load_at[u8[REGISTER_BYTES]](p, 0)
+                if any_in_first(v > 127, n) { return REGISTER_BYTES }
+                return 0
+            }
+        "#;
+        for (isa, bytes) in [(X86Isa::Sse42, 16), (X86Isa::Avx2, 32), (X86Isa::Avx512, 64)] {
+            let arch = Arch::X86_64(isa);
+            assert_eq!(arch.register_bytes(), bytes);
+            let ctx = create_context();
+            let items = parser::parse(source);
+            typecheck::typecheck_for(&items, &HashMap::new(), arch)
+                .unwrap_or_else(|e| panic!("{isa:?}: {:?}", e.iter().map(|x| x.to_string()).collect::<Vec<_>>()));
+            let module = compile_module_for(&ctx, &items, &HashMap::new(), arch);
+            assert!(module.as_operation().verify(), "{isa:?}");
+            let text = module.as_operation().to_string();
+            assert!(text.contains(&format!("vector<{bytes}xi8>")), "{isa:?}: {text}");
+        }
+        assert_eq!(X86Isa::from_name("avx512"), Some(X86Isa::Avx512));
+        assert_eq!(X86Isa::from_name("avx"), None);
+    }
+
+    #[test]
+    fn uncalled_generics_with_errors_at_every_width_are_rejected() {
+        for (source, expected) in [
+            ("fn g[N](x: u8[N]) -> u8[N] { return x + nonsense }", "nonsense"),
+            ("fn g[N](x: u8[N]) -> u16[N] { return x }", "return value"),
+            ("fn g[N](x: u8[N]) -> u8[N] { return sqrt(x, x, x) }", "sqrt"),
+            ("fn g[N](x: u8[N]) -> u8[N] { return h(x) }", "h"),
+            ("fn h[M](y: u8[M]) -> u8[M] { return y + missing }\nfn g[N](x: u8[N]) -> u8[N] { return h(x) }", "missing"),
+            ("fn g[N, M](x: u8[N], y: i32[M]) -> u8[N] { return nope }", "nope"),
+            ("fn g[N, M, K](x: u8[N], y: u8[M], z: u8[K]) -> u8[N] { return nope }", "nope"),
+            ("fn g[N](p: ptr[u8], n: i64) { stream c: u32[N] over p[0..n] tail leave { } }", "only supports u8"),
+            ("fn g[N](x: u8[N]) -> u8[N] { return x }\nfn k[N](x: u8[N]) -> u8[N] { return x + oops }", "oops"),
+        ] {
+            let message = rejection(source);
+            assert_ne!(message, "accepted", "should be rejected: {source}");
+            assert!(message.contains(expected), "{source}: expected '{expected}', got: {message}");
+            assert!(message.contains("every width tried"), "{source}: got: {message}");
+        }
+    }
+
+    #[test]
+    fn uncalled_generics_that_work_at_some_width_are_accepted() {
+        for source in [
+            "fn g[N](x: u8[N]) -> u8[N] { return x + x }",
+            // Only at N = 16.
+            "fn g[N](x: u8[N]) -> u8[N] { return tbl(x, x) }",
+            // Underflows at small widths.
+            "fn g[N](p: ptr[u8]) -> u8[N - 16] { return load_at[u8[N - 16]](p, 0) }",
+            // Only when M is twice N, or when N and M relate some other way.
+            "fn g[N, M](a: u8[N], b: u8[N]) -> u8[M] { return concat(a, b) }",
+            // A stream that only works at 16 lanes.
+            "fn g[N](p: ptr[u8], n: i64) -> i64 {
+                stream c: u8[N] over p[0..n] tail masked carry (s: i64 = 0) { carry s = s + chunk_len }
+                return s
+            }",
+            // Calls another generic nothing else calls, at a related width.
+            "fn h[M](y: u8[M]) -> u8[M] { return y }\nfn g[N](x: u8[N]) -> u8[N] { return h(x) }",
+        ] {
+            assert_eq!(rejection(source), "accepted", "{source}");
+        }
+    }
+
+    #[test]
+    fn a_called_generic_is_only_checked_at_the_widths_it_is_called_with() {
+        // tbl only works at 16 lanes, which is all this one is called with.
+        assert_eq!(
+            rejection("fn g[N](x: u8[N]) -> u8[N] { return tbl(x, x) }\nfn f(x: u8[16]) -> u8[16] { return g(x) }"),
+            "accepted"
+        );
+        let wrong = rejection("fn g[N](x: u8[N]) -> u8[N] { return tbl(x, x) }\nfn f(x: u8[32]) -> u8[32] { return g(x) }");
+        assert!(wrong.contains("tbl") && !wrong.contains("every width tried"), "{wrong}");
+    }
+
+    #[test]
+    fn trying_widths_leaves_real_functions_and_later_errors_alone() {
+        let source = "
+            fn g[N](x: u8[N]) -> u8[N] { return x + nonsense }
+            fn f(x: i64) -> i64 { return y }
+        ";
+        let message = rejection(source);
+        assert!(message.contains("nonsense") && message.contains("undefined variable: y"), "{message}");
+        // An uncalled generic that works at some widths doesn't change what gets compiled.
+        with_fn("fn g[N](x: u8[N]) -> u8[N] { return tbl(x, x) }\nfn f(x: i64) -> i64 { return x + 1 }", "f", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(3), 4);
+        });
+    }
+
+    #[test]
+    fn set_bits_visits_each_one_bit_lowest_first() {
+        let source = r#"
+            extern fn collect(bits: u64, out: ptr[i64]) -> i64 {
+                count: i64 = 0
+                for lane in set_bits(bits) {
+                    store_at(out, count, lane)
+                    count += 1
+                }
+                return count
+            }
+            extern fn first_above(bits: u64, floor: i64) -> i64 {
+                for lane in set_bits(bits) {
+                    if lane > floor { return lane }
+                }
+                return 0 - 1
+            }
+            extern fn stops_early(bits: u64) -> i64 {
+                count: i64 = 0
+                for lane in set_bits(bits) {
+                    if lane > 10 { break }
+                    count += 1
+                }
+                return count
+            }
+            extern fn keeps_its_input(bits: u64) -> u64 {
+                for lane in set_bits(bits) { }
+                return bits
+            }
+            comptime fn sum_of_positions(x: i64) -> i64 {
+                total: i64 = 0
+                for lane in set_bits(x) { total += lane }
+                return total
+            }
+            const SUMS = [u8: sum_of_positions(x) for x in 0..16]
+            extern fn from_table(i: i64) -> i64 { return to_i64(SUMS[i]) }
+        "#;
+        with_fn(source, "collect", |p| unsafe {
+            let f: extern "C" fn(u64, *mut i64) -> i64 = std::mem::transmute(p);
+            for bits in [0u64, 1, 2, 0b1011, 1 << 63, u64::MAX, 0x8000_0000_0000_0001, 0x00F0_0F00_F00F_F0F0] {
+                let mut out = [0i64; 64];
+                let count = f(bits, out.as_mut_ptr()) as usize;
+                let expected: Vec<i64> = (0..64).filter(|i| bits >> i & 1 == 1).collect();
+                assert_eq!(&out[..count], &expected[..], "{bits:#x}");
+            }
+        });
+        with_fn(source, "first_above", |p| unsafe {
+            let f: extern "C" fn(u64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(0b10010, 2), f(0b10010, 4), f(0, 0)), (4, -1, -1));
+        });
+        with_fn(source, "stops_early", |p| unsafe {
+            let f: extern "C" fn(u64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(0b1_0000_0000_0111), 3);
+        });
+        with_fn(source, "keeps_its_input", |p| unsafe {
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(p);
+            assert_eq!(f(0b101), 0b101);
+        });
+        with_fn(source, "from_table", |p| unsafe {
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(0), f(0b101), f(15)), (0, 2, 6));
+        });
+    }
+
+    #[test]
+    fn slices_carry_their_length() {
+        let source = r#"
+            -- The C signature is a pointer and then a length.
+            extern fn length(s: slice[u8]) -> i64 { return s.len }
+            extern fn byte_at(s: slice[u8], i: i64) -> i64 { return to_i64(s[i]) }
+            extern fn word_at(s: slice[u32], i: i64) -> i64 { return to_i64(s[i]) + s.len * 1000 }
+            extern fn through_ptr(s: slice[u8]) -> i64 { return to_i64(load_at(s.ptr, 1)) + to_i64(load_at(s, 2)) }
+
+            private fn total(s: slice[u8]) -> i64 {
+                sum: i64 = 0
+                for i in 0..s.len { sum += to_i64(s[i]) }
+                return sum
+            }
+            extern fn whole(s: slice[u8]) -> i64 { return total(s) }
+            extern fn middle(s: slice[u8], a: i64, b: i64) -> i64 { return total(s[a..b]) }
+            extern fn from_start(s: slice[u8], b: i64) -> i64 { return total(s[..b]) }
+            extern fn to_end(s: slice[u8], a: i64) -> i64 { return total(s[a..]) }
+            extern fn local(s: slice[u8], a: i64) -> i64 {
+                part = s[a..]
+                again = part
+                return total(again) * 1000 + again.len
+            }
+            extern fn shrinking(s: slice[u8]) -> i64 {
+                rest = s
+                count: i64 = 0
+                while rest.len > 0 {
+                    rest = rest[2..]
+                    count += 1
+                }
+                return count
+            }
+            extern fn chosen(s: slice[u8], first: bool) -> i64 {
+                if first { part = s[0..2] } else { part = s[2..] }
+                return total(part)
+            }
+            extern fn after_other_args(a: i64, s: slice[u8], b: i64) -> i64 { return a * 10000 + s.len * 100 + b }
+        "#;
+        let data: Vec<u8> = (1..=10).collect();
+        let (ptr, len) = (data.as_ptr(), data.len() as i64);
+        with_fn(source, "length", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len), 10);
+        });
+        with_fn(source, "byte_at", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len, 3), 4);
+        });
+        with_fn(source, "word_at", |p| unsafe {
+            let f: extern "C" fn(*const u32, i64, i64) -> i64 = std::mem::transmute(p);
+            let words = [7u32, 8, 9];
+            assert_eq!(f(words.as_ptr(), 3, 2), 3009, "indexing and length count elements");
+        });
+        with_fn(source, "through_ptr", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len), 5);
+        });
+        with_fn(source, "whole", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len), 55);
+        });
+        with_fn(source, "middle", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len, 2, 5), 3 + 4 + 5);
+        });
+        with_fn(source, "from_start", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len, 3), 6);
+        });
+        with_fn(source, "to_end", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len, 8), 19);
+        });
+        with_fn(source, "local", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len, 8), 19 * 1000 + 2);
+        });
+        with_fn(source, "shrinking", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(ptr, len), 5, "a slice assigned to itself uses the old length");
+        });
+        with_fn(source, "chosen", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, bool) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(ptr, len, true), f(ptr, len, false)), (3, 52));
+        });
+        with_fn(source, "after_other_args", |p| unsafe {
+            let f: extern "C" fn(i64, *const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(1, ptr, len, 7), 11007);
+        });
+    }
+
+    #[test]
+    fn a_stream_can_cover_a_slice_or_part_of_one() {
+        let source = r#"
+            extern fn count_whole(s: slice[u8]) -> i64 {
+                stream c: u8[16] over s tail masked carry (seen: i64 = 0) { carry seen = seen + chunk_len }
+                return seen
+            }
+            extern fn count_rest(s: slice[u8], a: i64) -> i64 {
+                stream c: u8[16] over s[a..] tail masked carry (seen: i64 = 0) { carry seen = seen + chunk_len }
+                return seen
+            }
+            extern fn count_first(s: slice[u8], b: i64) -> i64 {
+                stream c: u8[16] over s[..b] tail masked carry (seen: i64 = 0) { carry seen = seen + chunk_len }
+                return seen
+            }
+            extern fn clean_prefix(s: slice[u8], dst: ptr[u8]) -> i64 {
+                stream c: u8[REGISTER_BYTES] over s tail overlap until c == 200 {
+                    store_at(dst, chunk_offset, c)
+                }
+                return chunk_offset
+            }
+        "#;
+        let mut backing = vec![65u8; 8192 * 3];
+        let base = backing.as_ptr() as usize;
+        let aligned = (8192 - base % 8192) % 8192 + 512;
+        let data = &mut backing[aligned..];
+        with_fn(source, "count_whole", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!((f(data.as_ptr(), 0), f(data.as_ptr(), 100)), (0, 100));
+        });
+        with_fn(source, "count_rest", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(data.as_ptr(), 100, 30), 70);
+        });
+        with_fn(source, "count_first", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, i64) -> i64 = std::mem::transmute(p);
+            assert_eq!(f(data.as_ptr(), 100, 30), 30);
+        });
+        with_fn(source, "clean_prefix", |p| unsafe {
+            let f: extern "C" fn(*const u8, i64, *mut u8) -> i64 = std::mem::transmute(p);
+            let mut dst = vec![0u8; 1024];
+            let register = Arch::host().register_bytes() as usize;
+            let n = 4 * register + 5;
+            assert_eq!(f(data.as_ptr(), n as i64, dst.as_mut_ptr()), n as i64);
+            data[2 * register + 1] = 200;
+            assert_eq!(f(data.as_ptr(), n as i64, dst.as_mut_ptr()), 2 * register as i64);
+        });
+    }
+
+    #[test]
+    fn slices_and_set_bits_reject_misuse() {
+        for (source, expected) in [
+            ("fn f(s: slice[u8]) -> slice[u8] { return s }", "can't return a slice"),
+            ("struct A[N] { s: slice[u8] }\nfn f() -> i64 { return 0 }", "slice field"),
+            ("fn f(s: slice[u8], n: i64) -> i64 { s = n\n return 0 }", "can only be assigned a slice"),
+            ("fn f(p: ptr[u8]) -> i64 { q = p[1..]\n return 0 }", "only a slice can be sliced"),
+            ("fn g(s: slice[u8]) -> i64 { return s.len }\nfn f(p: ptr[u8]) -> i64 { return g(p) }", "must be a slice"),
+            ("fn g(s: slice[u8]) -> i64 { return s.len }\nfn f(p: ptr[u8]) -> i64 { return g(p[1..]) }", "only a slice can be sliced"),
+            ("fn f(s: slice[u8]) -> i64 { return s[1..].len }", "can only be assigned"),
+            ("fn f(s: slice[u8]) -> i64 { return s.size }", "`.len` and `.ptr`"),
+            ("fn g(s: slice[u8]) -> i64 { return 0 }\nfn f(s: slice[u8]) -> i64 { return g(s = s) }", "by name"),
+            ("fn f(p: ptr[u8]) -> i64 { stream c: u8[16] over p tail leave { }\n return 0 }", "has no length"),
+            ("fn f(p: ptr[u8]) -> i64 { stream c: u8[16] over p[1..] tail leave { }\n return 0 }", "has no length"),
+            ("fn f(p: ptr[u8]) -> i64 { return p[1] }", "only const tables and slices"),
+            ("fn f(x: i64) -> i64 { for i in set_bits(x) { i = 1 }\n return 0 }", "can't be assigned"),
+            ("fn f(x: u8[16]) -> i64 { for i in set_bits(x) { }\n return 0 }", "64-bit scalar"),
+            ("fn f(x: u32) -> i64 { for i in set_bits(x) { }\n return 0 }", "64-bit scalar"),
+            ("fn set_bits(x: i64) -> i64 { return x }", "same name as a builtin"),
+        ] {
+            let message = rejection(source);
+            assert_ne!(message, "accepted", "should be rejected: {source}");
+            assert!(message.contains(expected), "{source}: expected '{expected}', got: {message}");
+        }
     }
 
     #[test]

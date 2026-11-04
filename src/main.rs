@@ -1,11 +1,15 @@
 mod ast;
 mod codegen;
 mod comptime;
+mod consteval;
 mod desugar;
+mod dispatch;
+mod streams;
 #[cfg(test)]
 mod json;
 mod lexer;
 mod parser;
+mod slices;
 mod typecheck;
 
 use melior::ir::operation::OperationLike;
@@ -17,6 +21,9 @@ fn main() {
     // that. RUST_BACKTRACE=1 restores the full report, for debugging the compiler itself.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::panic::set_hook(Box::new(|info| {
+            if typecheck::trying_widths() {
+                return;
+            }
             let payload = info.payload();
             let message = payload
                 .downcast_ref::<&str>()
@@ -30,7 +37,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>] [--target <triple>] [--cpu <cpu>]");
+        eprintln!("Usage: simd-lang compile <file.simd> [-o <output_dir>] [--target <triple>] [--cpu <cpu>] [--isa <level>] [--dispatch <levels>]");
         eprintln!("       simd-lang compile <file.simd> --emit-mlir");
         std::process::exit(1);
     }
@@ -146,6 +153,8 @@ fn cmd_compile(args: &[String]) {
     let mut emit_mlir = false;
     let mut triple = codegen::Arch::host_triple().to_string();
     let mut cpu: Option<String> = None;
+    let mut isa: Option<codegen::X86Isa> = None;
+    let mut dispatch: Option<Vec<codegen::X86Isa>> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -165,6 +174,26 @@ fn cmd_compile(args: &[String]) {
                 i += 1;
                 cpu = Some(args[i].clone());
             }
+            "--isa" => {
+                i += 1;
+                isa = Some(codegen::X86Isa::from_name(&args[i]).unwrap_or_else(|| {
+                    eprintln!("Unknown --isa {}: use sse4.2, avx2 or avx512", args[i]);
+                    std::process::exit(1);
+                }));
+            }
+            "--dispatch" => {
+                i += 1;
+                let isas = args[i]
+                    .split(',')
+                    .map(|name| {
+                        codegen::X86Isa::from_name(name).unwrap_or_else(|| {
+                            eprintln!("Unknown --dispatch level {}: use sse4.2, avx2 or avx512", name);
+                            std::process::exit(1);
+                        })
+                    })
+                    .collect();
+                dispatch = Some(isas);
+            }
             other => {
                 eprintln!("Unknown option: {}", other);
                 std::process::exit(1);
@@ -183,59 +212,98 @@ fn cmd_compile(args: &[String]) {
         eprintln!("Unsupported target: {} (expected aarch64-* or x86_64-*)", triple);
         std::process::exit(1);
     });
+    let arch = match (arch, isa) {
+        (arch, None) => arch,
+        (codegen::Arch::X86_64(_), Some(isa)) => codegen::Arch::X86_64(isa),
+        (codegen::Arch::Aarch64, Some(_)) => {
+            eprintln!("--isa only applies to x86_64 targets");
+            std::process::exit(1);
+        }
+    };
 
     // Parse
     let items = parser::parse(&source);
 
-    // Type check
-    if let Err(errors) = typecheck::typecheck_for(&items, &HashMap::new(), arch) {
-        for e in &errors {
-            eprintln!("{}: {}", input_path.display(), e);
-        }
-        std::process::exit(1);
-    }
-
-    // Compile to MLIR
-    let ctx = codegen::create_context();
-    let mut module = codegen::compile_module_for(&ctx, &items, &HashMap::new(), arch);
-
-    if !module.as_operation().verify() {
-        eprintln!("MLIR verification failed:");
-        eprintln!("{}", module.as_operation());
-        std::process::exit(1);
-    }
-
-    if emit_mlir {
-        println!("{}", module.as_operation());
-        return;
-    }
-
-    // Lower to LLVM
-    codegen::lower_to_llvm_for(&ctx, &mut module, &triple).unwrap_or_else(|e| {
-        eprintln!("LLVM lowering failed: {}", e);
-        std::process::exit(1);
-    });
-
     // Create output directory
-    std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-        eprintln!("Error creating output directory: {}", e);
-        std::process::exit(1);
-    });
+    if !emit_mlir {
+        std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
+            eprintln!("Error creating output directory: {}", e);
+            std::process::exit(1);
+        });
+    }
 
-    // Produce the object file with the LLVM tools rather than the JIT's
-    // ExecutionEngine: the JIT uses the large code model, where every constant-pool
-    // and table access goes through the GOT, and it adds a `_mlir_` wrapper per fn.
-    let obj_path = output_dir.join(format!("{}.o", stem));
-    compile_to_object(&module, &output_dir, &stem, &obj_path, &triple, arch, cpu.as_deref()).unwrap_or_else(|e| {
-        eprintln!("object generation failed: {}", e);
-        std::process::exit(1);
-    });
+    let mut objects = Vec::new();
+    if let Some(isas) = &dispatch {
+        if !matches!(arch, codegen::Arch::X86_64(_)) {
+            eprintln!("--dispatch only applies to x86_64 targets");
+            std::process::exit(1);
+        }
+        if emit_mlir || cpu.is_some() || isa.is_some() {
+            eprintln!("--dispatch can't be combined with --emit-mlir, --cpu or --isa");
+            std::process::exit(1);
+        }
+        for &level in isas {
+            let renamed = dispatch::with_isa_suffix(&items, level);
+            let suffix = dispatch::isa_suffix(level);
+            let obj_path = output_dir.join(format!("{}_{}.o", stem, suffix));
+            let unit = CompileUnit {
+                input_path: &input_path,
+                output_dir: &output_dir,
+                stem: &format!("{}_{}", stem, suffix),
+                obj_path: &obj_path,
+                triple: &triple,
+                arch: codegen::Arch::X86_64(level),
+                cpu: None,
+            };
+            compile_unit(&renamed, &unit, false);
+            objects.push(obj_path);
+        }
+        let c_path = output_dir.join(format!("{}_dispatch.c", stem));
+        let obj_path = output_dir.join(format!("{}_dispatch.o", stem));
+        std::fs::write(&c_path, dispatch::dispatcher_source(&stem, &items, isas)).unwrap();
+        let target_arg = format!("--target={}", triple);
+        let status = std::process::Command::new(llvm_tool("clang"))
+            .args(["-O3", "-fno-stack-protector", target_arg.as_str(), "-c"])
+            .args([c_path.to_str().unwrap(), "-o", obj_path.to_str().unwrap()])
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("cannot run clang: {}", e);
+                std::process::exit(1);
+            });
+        if !status.success() {
+            eprintln!("compiling the dispatcher failed");
+            std::process::exit(1);
+        }
+        if std::env::var_os("SIMD_LANG_KEEP_IR").is_none() {
+            let _ = std::fs::remove_file(&c_path);
+        }
+        objects.push(obj_path);
+    } else {
+        let obj_path = output_dir.join(format!("{}.o", stem));
+        let unit = CompileUnit {
+            input_path: &input_path,
+            output_dir: &output_dir,
+            stem: &stem,
+            obj_path: &obj_path,
+            triple: &triple,
+            arch,
+            cpu: cpu.as_deref(),
+        };
+        compile_unit(&items, &unit, emit_mlir);
+        if emit_mlir {
+            return;
+        }
+        objects.push(obj_path);
+    }
 
     // Archive into static library
     let lib_path = output_dir.join(format!("lib{}.a", stem));
+    // `rcs` adds to an archive that exists, which would keep members of an older build.
+    let _ = std::fs::remove_file(&lib_path);
     let archiver = llvm_tool("llvm-ar");
     let status = std::process::Command::new(&archiver)
-        .args(["rcs", lib_path.to_str().unwrap(), obj_path.to_str().unwrap()])
+        .args(["rcs", lib_path.to_str().unwrap()])
+        .args(objects.iter().map(|o| o.to_str().unwrap()))
         .status()
         .unwrap_or_else(|e| {
             eprintln!("cannot run {}: {}", archiver.display(), e);
@@ -251,12 +319,63 @@ fn cmd_compile(args: &[String]) {
     let bindings = generate_rust_bindings(&stem, &items);
     std::fs::write(&rs_path, bindings).unwrap();
 
-    // Clean up object file
-    let _ = std::fs::remove_file(&obj_path);
+    // Clean up object files
+    for object in &objects {
+        let _ = std::fs::remove_file(object);
+    }
 
     eprintln!("Compiled {} →", input_path.display());
     eprintln!("  {}", lib_path.display());
     eprintln!("  {}", rs_path.display());
+}
+
+/// One object to produce: the program, built for one instruction set.
+struct CompileUnit<'a> {
+    input_path: &'a std::path::Path,
+    output_dir: &'a std::path::Path,
+    stem: &'a str,
+    obj_path: &'a std::path::Path,
+    triple: &'a str,
+    arch: codegen::Arch,
+    cpu: Option<&'a str>,
+}
+
+/// Type check and compile `items` to an object file, or print the MLIR instead.
+fn compile_unit(items: &[ast::Item], unit: &CompileUnit, emit_mlir: bool) {
+    if let Err(errors) = typecheck::typecheck_for(items, &HashMap::new(), unit.arch) {
+        for e in &errors {
+            eprintln!("{}: {}", unit.input_path.display(), e);
+        }
+        std::process::exit(1);
+    }
+
+    let ctx = codegen::create_context();
+    let mut module = codegen::compile_module_for(&ctx, items, &HashMap::new(), unit.arch);
+
+    if !module.as_operation().verify() {
+        eprintln!("MLIR verification failed:");
+        eprintln!("{}", module.as_operation());
+        std::process::exit(1);
+    }
+
+    if emit_mlir {
+        println!("{}", module.as_operation());
+        return;
+    }
+
+    codegen::lower_to_llvm_for(&ctx, &mut module, unit.triple).unwrap_or_else(|e| {
+        eprintln!("LLVM lowering failed: {}", e);
+        std::process::exit(1);
+    });
+
+    // Produce the object file with the LLVM tools rather than the JIT's
+    // ExecutionEngine: the JIT uses the large code model, where every constant-pool
+    // and table access goes through the GOT, and it adds a `_mlir_` wrapper per fn.
+    compile_to_object(&module, unit.output_dir, unit.stem, unit.obj_path, unit.triple, unit.arch, unit.cpu)
+        .unwrap_or_else(|e| {
+            eprintln!("object generation failed: {}", e);
+            std::process::exit(1);
+        });
 }
 
 /// The LLVM install matching the MLIR this compiler links against.
@@ -302,9 +421,9 @@ fn compile_to_object(
         (codegen::Arch::Aarch64, Some(cpu)) => vec![format!("-mcpu={}", cpu)],
         (codegen::Arch::Aarch64, None) if triple.contains("apple") => vec!["-mcpu=apple-m1".to_string()],
         (codegen::Arch::Aarch64, None) => vec![],
-        (codegen::Arch::X86_64, Some(cpu)) => vec![format!("-march={}", cpu)],
+        (codegen::Arch::X86_64(_), Some(cpu)) => vec![format!("-march={}", cpu)],
         // The instructions `Arch::X86_64` promises.
-        (codegen::Arch::X86_64, None) => vec!["-march=x86-64-v3".to_string(), "-mpclmul".to_string()],
+        (codegen::Arch::X86_64(isa), None) => vec![format!("-march={}", isa.march()), "-mpclmul".to_string()],
     };
     let mut clang_args = vec!["-x", "ir", "-O3", "-Wno-override-module", target_arg.as_str()];
     clang_args.extend(cpu_args.iter().map(String::as_str));
@@ -483,10 +602,23 @@ fn build_extern_return(f: &ast::FnDef) -> String {
 }
 
 /// Generate a safe Rust wrapper function.
+/// The parameters that are the length of the slice before them, which a Rust slice carries.
+fn slice_lengths(f: &ast::FnDef) -> Vec<String> {
+    f.params
+        .windows(2)
+        .filter(|pair| is_ptr_param(&pair[0]) && pair[1].name == format!("{}__len", pair[0].name))
+        .map(|pair| pair[1].name.clone())
+        .collect()
+}
+
 fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
     // Build safe parameter list
     let mut safe_params = Vec::new();
+    let lengths = slice_lengths(f);
     for p in &f.params {
+        if lengths.contains(&p.name) {
+            continue;
+        }
         if is_ptr_param(p) {
             let elem = ptr_elem(p);
             let rust_ty = scalar_to_rust(elem);
@@ -518,7 +650,9 @@ fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
     // Build call arguments
     let mut call_args = Vec::new();
     for p in &f.params {
-        if is_ptr_param(p) && f.extern_c {
+        if let Some(slice) = p.name.strip_suffix("__len").filter(|_| lengths.contains(&p.name)) {
+            call_args.push(format!("{}.len() as i64", slice));
+        } else if is_ptr_param(p) && f.extern_c {
             call_args.push(format!("{}.as_mut_ptr()", p.name));
         } else if is_ptr_param(p) {
             call_args.push(format!("{}.as_mut_ptr()", p.name));
@@ -544,4 +678,25 @@ fn generate_safe_wrapper(out: &mut String, f: &ast::FnDef) {
 
     out.push_str("    }\n");
     out.push_str("}\n\n");
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn a_slice_is_one_rust_argument_and_two_c_ones() {
+        let items = parser::parse("extern fn f(s: slice[u8], n: i64, d: ptr[u8]) -> i64 { return s.len + n }");
+        let bindings = generate_rust_bindings("m", &items);
+        assert!(bindings.contains("fn __simd_f(s: *mut u8, s__len: i64, n: i64, d: *mut u8) -> i64"), "{bindings}");
+        assert!(bindings.contains("pub fn f(s: &mut [u8], n: i64, d: &mut [u8]) -> i64"), "{bindings}");
+        assert!(bindings.contains("__simd_f(s.as_mut_ptr(), s.len() as i64, n, d.as_mut_ptr())"), "{bindings}");
+    }
+
+    #[test]
+    fn a_pointer_and_an_unrelated_integer_stay_two_rust_arguments() {
+        let items = parser::parse("extern fn f(s: ptr[u8], n: i64) -> i64 { return n }");
+        let bindings = generate_rust_bindings("m", &items);
+        assert!(bindings.contains("pub fn f(s: &mut [u8], n: i64) -> i64"), "{bindings}");
+    }
 }

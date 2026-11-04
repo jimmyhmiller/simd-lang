@@ -3,12 +3,22 @@
 
 extern "C" {
     fn json_escape(src: *const u8, n: i64, dst: *mut u8) -> i64;
+    #[cfg(feature = "dispatch")]
+    fn json_escape_isa() -> *const std::ffi::c_char;
 }
 
-/// Bytes `value` may touch in the output buffer: the kernel's stores overshoot.
+/// Which instruction set this CPU got: "sse42", "avx2" or "avx512".
+#[cfg(feature = "dispatch")]
+pub fn isa() -> &'static str {
+    unsafe { std::ffi::CStr::from_ptr(json_escape_isa()) }.to_str().expect("level names are ASCII")
+}
+
+/// Bytes `value` may touch in the output buffer: the kernel's stores overshoot by up to one
+/// register. On x86 that allows for AVX-512, whichever instructions this build uses.
 #[inline(always)]
 pub const fn scratch_len(input_len: usize) -> usize {
-    input_len * 6 + 32 + 3
+    let register = if cfg!(target_arch = "x86_64") { 64 } else { 32 };
+    input_len * 6 + register + 3
 }
 
 /// # Safety
