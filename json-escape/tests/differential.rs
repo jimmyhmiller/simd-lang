@@ -162,7 +162,7 @@ fn input_flush_against_either_page_edge() {
 #[test]
 fn output_never_passes_the_documented_bound() {
     let g = Guarded::new();
-    for len in 0..=(g.page - 35) / 6 {
+    for len in 0..=(g.page - scratch_len(0)) / 6 {
         for fill in [b'x', b'"', 0x01u8, b'\n'] {
             let src = vec![fill; len];
             let expected = serde_json::to_string(std::str::from_utf8(&src).unwrap()).unwrap();
@@ -174,5 +174,22 @@ fn output_never_passes_the_documented_bound() {
                 assert_eq!(out, expected.as_bytes(), "len {len}");
             }
         }
+    }
+}
+
+/// The hand-written CPU check against Rust's own, on whatever CPU this runs on.
+#[cfg(all(feature = "dispatch", target_arch = "x86_64"))]
+#[test]
+fn dispatch_picks_the_best_level_this_cpu_can_run() {
+    use std::arch::is_x86_feature_detected as has;
+    let v4 = has!("avx512f") && has!("avx512bw") && has!("avx512cd") && has!("avx512dq") && has!("avx512vl");
+    let v3 = has!("avx2") && has!("bmi1") && has!("bmi2") && has!("fma") && has!("lzcnt") && has!("movbe") && has!("f16c");
+    // A build doesn't have to include AVX-512, but it must never pick more than the CPU has,
+    // or less than AVX2 when the CPU has that.
+    match simd_json_escape::isa() {
+        "avx512" => assert!(v3 && v4),
+        "avx2" => assert!(v3),
+        "sse42" => assert!(!v3),
+        other => panic!("unknown level {other}"),
     }
 }

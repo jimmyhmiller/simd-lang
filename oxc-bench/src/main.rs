@@ -9,14 +9,20 @@ mod bench;
 mod codegen;
 #[path = "../../src/comptime.rs"]
 mod comptime;
+#[path = "../../src/consteval.rs"]
+mod consteval;
 #[path = "../../src/desugar.rs"]
 mod desugar;
+#[path = "../../src/streams.rs"]
+mod streams;
 #[path = "../../src/js.rs"]
 mod js;
 #[path = "../../src/lexer.rs"]
 mod lexer;
 #[path = "../../src/parser.rs"]
 mod parser;
+#[path = "../../src/slices.rs"]
+mod slices;
 #[path = "../../src/stage1.rs"]
 mod stage1;
 

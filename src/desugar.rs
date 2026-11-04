@@ -31,6 +31,7 @@ fn check_names(items: &[Item]) {
             Item::Fn(def) => ("function", &def.name),
             Item::Struct(def) => ("struct", &def.name),
             Item::Const(def) => ("const", &def.name),
+            Item::ComptimeFn(def) => ("function", &def.name),
         };
         if !seen.insert(name.clone()) {
             panic!("{} '{}' is defined twice", kind, name);
@@ -39,7 +40,7 @@ fn check_names(items: &[Item]) {
             panic!("REGISTER_BYTES is reserved");
         }
         match item {
-            Item::Fn(def) => {
+            Item::Fn(def) | Item::ComptimeFn(def) => {
                 if BUILTINS.contains(&name.as_str()) {
                     panic!("function '{}' has the same name as a builtin", name);
                 }
@@ -78,6 +79,14 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut Vec<String>) {
                 out.extend(carry.iter().map(|c| c.name.clone()));
                 collect_assigned(body, out);
             }
+            StmtKind::RangeStream(stream) => {
+                out.push(stream.chunk_name.clone());
+                out.extend(stream.carry.iter().map(|c| c.name.clone()));
+                collect_assigned(&stream.body, out);
+                if let Some(stopped) = &stream.stopped {
+                    collect_assigned(stopped, out);
+                }
+            }
             _ => {}
         }
     }
@@ -85,6 +94,8 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut Vec<String>) {
 
 pub fn desugar_items(items: Vec<Item>) -> Vec<Item> {
     check_names(&items);
+    let items = crate::slices::lower(items);
+    let items = crate::consteval::resolve(items);
     let structs: HashMap<String, StructDef> = items
         .iter()
         .filter_map(|item| match item {
@@ -92,16 +103,36 @@ pub fn desugar_items(items: Vec<Item>) -> Vec<Item> {
             _ => None,
         })
         .collect();
+    let fns: HashMap<String, FnDef> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(def) => Some((def.name.clone(), def.clone())),
+            _ => None,
+        })
+        .collect();
     items
         .into_iter()
         .map(|item| match item {
             Item::Fn(mut def) => {
-                desugar_fn(&mut def, &structs);
+                if crate::streams::has_range_stream(&def.body) {
+                    // Expansion needs the register width, so lowering escapes waits for it.
+                    crate::streams::check_until_is_pure(&def.body, &fns);
+                    def.ret_struct = def.ret_ty.as_ref().and_then(|ret| structs.get(&ret.name)).cloned();
+                } else {
+                    desugar_fn(&mut def, &structs);
+                }
                 Item::Fn(def)
             }
             other => other,
         })
         .collect()
+}
+
+/// Lower the escapes of a function whose range streams have just been expanded.
+pub fn desugar_expanded_fn(def: &mut FnDef) {
+    let structs: HashMap<String, StructDef> =
+        def.ret_struct.iter().map(|s| (s.name.clone(), s.clone())).collect();
+    desugar_fn(def, &structs);
 }
 
 fn desugar_fn(def: &mut FnDef, structs: &HashMap<String, StructDef>) {
@@ -225,7 +256,7 @@ fn may_break(stmt: &Stmt) -> bool {
 }
 
 /// Whether the statements never fall through to whatever follows them.
-fn always_escapes(stmts: &[Stmt]) -> bool {
+pub fn always_escapes(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_always_escapes)
 }
 
@@ -395,6 +426,7 @@ impl Lowering {
                         span,
                     });
                 }
+                StmtKind::RangeStream(_) => unreachable!("range streams are expanded before lowering"),
                 other => unreachable!("{:?} has no nested statements", other),
             }
         }
